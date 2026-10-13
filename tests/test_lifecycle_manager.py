@@ -1,3 +1,19 @@
+# Copyright 2026 Nicolas Bruna
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """WP2B tests: lifecycle manager with fake adapter and fake clock."""
 
 from __future__ import annotations
@@ -379,6 +395,187 @@ def test_terminate_failure_consistent_record():
 
 def _raising_terminate(self=None):
     raise RuntimeError("terminate failed")
+
+
+class ScriptedStatusHandle(FakeHandle):
+    """Deterministic scripted probe sequence with call counting."""
+
+    def __init__(self, script):
+        super().__init__(alive=True)
+        self._script = list(script)
+        self.probe_calls = 0
+
+    def _next(self, kind):
+        self.probe_calls += 1
+        assert self._script, f"unexpected extra probe ({kind})"
+        outcome = self._script.pop(0)
+        assert outcome[0] == kind, outcome
+        action = outcome[1]
+        if isinstance(action, Exception):
+            raise action
+        return action
+
+    def poll(self):
+        return self._next("poll")
+
+    def is_alive(self):
+        return self._next("alive")
+
+
+class CountingUnknownHandle(FakeHandle):
+    """Always unknown; counts poll/is_alive invocations."""
+
+    def __init__(self):
+        super().__init__(alive=True)
+        self.poll_calls = 0
+        self.alive_calls = 0
+
+    def poll(self):
+        self.poll_calls += 1
+        raise RuntimeError("poll unavailable")
+
+    def is_alive(self):
+        self.alive_calls += 1
+        raise RuntimeError("status unavailable")
+
+
+def _start_with_handle(mgr, adapter, handle):
+    adapter.behavior = "ok"
+    adapter.handle = handle
+    return mgr.start(ABS_PYTHON)
+
+
+def test_initial_alive_ok_running():
+    mgr, adapter, _ = make()
+    res = _start_with_handle(mgr, adapter, FakeHandle(alive=True))
+    assert res.status == "ok"
+    assert res.state is LifecycleState.RUNNING
+    assert res.error is None
+    assert mgr.state is LifecycleState.RUNNING
+    assert mgr.has_owned_handle is True
+    assert mgr.ownership_unresolved is False
+    assert len(adapter.calls) == 1
+
+
+def test_initial_unknown_pending_starting():
+    mgr, adapter, _ = make()
+    handle = CountingUnknownHandle()
+    res = _start_with_handle(mgr, adapter, handle)
+    assert res.status == "pending"
+    assert res.state is LifecycleState.STARTING
+    assert res.error is None
+    assert mgr.state is LifecycleState.STARTING
+    assert mgr.has_owned_handle is True
+    assert mgr._handle is handle
+    assert mgr.ownership_unresolved is False
+    assert handle.terminates == 0
+    assert handle.kills == 0
+
+
+def test_initial_unknown_partial_handle_pending():
+    mgr, adapter, _ = make("uncertain-partial")
+    adapter.partial = CountingUnknownHandle()
+    res = mgr.start(ABS_PYTHON)
+    assert res.status == "pending"
+    assert res.state is LifecycleState.STARTING
+    assert res.error is None
+    assert mgr.has_owned_handle is True
+    assert mgr.ownership_unresolved is False
+
+
+def test_continued_unknown_preserves_starting_no_signals():
+    mgr, adapter, clock = make()
+    handle = CountingUnknownHandle()
+    _start_with_handle(mgr, adapter, handle)
+    assert mgr.state is LifecycleState.STARTING
+    clock.advance(10.0)
+    mgr.observe()
+    assert mgr.state is LifecycleState.STARTING
+    assert mgr.has_owned_handle is True
+    assert mgr._handle is handle
+    assert handle.terminates == 0
+    assert handle.kills == 0
+    res = mgr.stop()
+    assert res.status == "pending"
+    assert res.error is None
+    assert mgr.state is LifecycleState.STARTING
+    assert handle.terminates == 0
+    assert mgr.has_owned_handle is True
+
+
+def test_confirmed_liveness_resolves_starting_to_running():
+    mgr, adapter, _ = make()
+    unknown = CountingUnknownHandle()
+    _start_with_handle(mgr, adapter, unknown)
+    assert mgr.state is LifecycleState.STARTING
+    alive = FakeHandle(alive=True)
+    mgr._handle = alive
+    adapter.handle = alive
+    mgr.observe()
+    assert mgr.state is LifecycleState.RUNNING
+    assert mgr.has_owned_handle is True
+    assert alive.terminates == 0
+    assert alive.kills == 0
+
+
+def test_confirmed_exit_from_starting_unexpected_exit():
+    mgr, adapter, _ = make()
+    _start_with_handle(mgr, adapter, CountingUnknownHandle())
+    assert mgr.state is LifecycleState.STARTING
+    exited = FakeHandle(alive=True)
+    exited.exit(7)
+    mgr._handle = exited
+    adapter.handle = exited
+    mgr.observe()
+    assert mgr.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.has_owned_handle is False
+    assert mgr.discard_terminated_handle() is False
+
+
+def test_duplicate_start_while_starting_refused():
+    mgr, adapter, _ = make()
+    _start_with_handle(mgr, adapter, CountingUnknownHandle())
+    assert mgr.state is LifecycleState.STARTING
+    res = mgr.start(ABS_PYTHON)
+    assert res.status == "refused"
+    assert res.error is None
+    assert len(adapter.calls) == 1
+    assert mgr.state is LifecycleState.STARTING
+    assert mgr.has_owned_handle is True
+
+
+def test_pending_distinct_from_unresolved_ownership():
+    mgr, adapter, _ = make()
+    res = _start_with_handle(mgr, adapter, CountingUnknownHandle())
+    assert res.status == "pending"
+    assert mgr.ownership_unresolved is False
+    stuck, _, _ = make("uncertain-no-handle")
+    failed = stuck.start(ABS_PYTHON)
+    assert failed.status == "failed"
+    assert stuck.ownership_unresolved is True
+    assert stuck.start(ABS_PYTHON).status == "refused"
+    assert mgr.start(ABS_PYTHON).status == "refused"
+    assert mgr.ownership_unresolved is False
+
+
+def test_observe_single_probe_per_call():
+    mgr, adapter, _ = make()
+    handle = ScriptedStatusHandle([("poll", None), ("alive", True)])
+    _start_with_handle(mgr, adapter, handle)
+    handle._script = [("poll", None), ("alive", True)]
+    calls_before = handle.probe_calls
+    mgr.observe()
+    assert handle.probe_calls - calls_before == 2
+    assert mgr.state is LifecycleState.RUNNING
+    mgr2, adapter2, _ = make()
+    unknown = CountingUnknownHandle()
+    _start_with_handle(mgr2, adapter2, unknown)
+    polls = unknown.poll_calls
+    alives = unknown.alive_calls
+    mgr2.observe()
+    assert unknown.poll_calls - polls == 1
+    assert unknown.alive_calls - alives == 1
+    assert mgr2.state is LifecycleState.STARTING
 
 
 def test_generic_spawn_exception_is_indeterminate():

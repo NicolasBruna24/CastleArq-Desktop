@@ -1,3 +1,19 @@
+# Copyright 2026 Nicolas Bruna
+#
+# SPDX-License-Identifier: Apache-2.0
+#
+# Licensed under the Apache License, Version 2.0 (the "License");
+# you may not use this file except in compliance with the License.
+# You may obtain a copy of the License at
+#
+#     http://www.apache.org/licenses/LICENSE-2.0
+#
+# Unless required by applicable law or agreed to in writing, software
+# distributed under the License is distributed on an "AS IS" BASIS,
+# WITHOUT WARRANTIES OR CONDITIONS OF ANY KIND, either express or implied.
+# See the License for the specific language governing permissions and
+# limitations under the License.
+
 """WP2B — Core process lifecycle manager (contract C1–C8)."""
 
 from __future__ import annotations
@@ -130,17 +146,29 @@ class LifecycleManager:
             return "unknown"
         return "alive"
 
-    def _handle_exited(self) -> tuple:
+    def _observe_status(self) -> tuple:
+        """Return a tri-state observation: ("exited"|"alive"|"unknown", code).
+
+        A single status probe is performed per call; the exit code is only
+        re-read when the status is confirmed "exited". "unknown" means
+        neither liveness nor termination is confirmed.
+        """
         status = self._probe_status()
+        if status != "exited":
+            return status, None
+        # Re-read the exit code when available; never raises.
+        try:
+            code = self._handle.poll()  # type: ignore[union-attr]
+        except Exception:
+            return status, None
+        if code is not None:
+            return status, code
+        return status, None
+
+    def _handle_exited(self) -> tuple:
+        status, code = self._observe_status()
         if status == "exited":
-            # Re-read the exit code when available; never raises.
-            try:
-                code = self._handle.poll()  # type: ignore[union-attr]
-            except Exception:
-                return True, None
-            if code is not None:
-                return True, code
-            return True, None
+            return True, code
         return False, None
 
     def start(self, validated_python: str) -> OperationResult:
@@ -231,8 +259,8 @@ class LifecycleManager:
         return self._adopt_and_observe()
 
     def _adopt_and_observe(self) -> OperationResult:
-        exited, code = self._handle_exited()
-        if exited:
+        status, code = self._observe_status()
+        if status == "exited":
             self._last_exit_code = code
             self.state = LifecycleState.UNEXPECTED_EXIT
             self.shutdown_phase = ShutdownPhase.IDLE
@@ -240,6 +268,12 @@ class LifecycleManager:
                                    detail="Exited immediately after launch.",
                                    context={"immediate_exit": True,
                                             "exit_code": code})
+        if status == "unknown":
+            self.state = LifecycleState.STARTING
+            return OperationResult(status="pending", state=self.state,
+                                   error=None,
+                                   detail="Startup pending; status unknown.",
+                                   context={"pending_startup": True})
         self.state = LifecycleState.RUNNING
         return OperationResult(status="ok", state=self.state, error=None,
                                detail="Started and owned.",
@@ -335,8 +369,8 @@ class LifecycleManager:
         handle = self._handle
         if handle is None:
             return
-        exited, code = self._handle_exited()
-        if exited:
+        status, code = self._observe_status()
+        if status == "exited":
             self._last_exit_code = code
             self._handle = None
             self._stop_requested_at = None
@@ -356,7 +390,10 @@ class LifecycleManager:
             return
         # Unknown status: probes failed, so neither exit nor aliveness is
         # confirmed. Never escalate, signal, or exhaust the budget here.
-        if self._probe_status() == "unknown":
+        if status == "unknown":
+            return
+        if self.state is LifecycleState.STARTING:
+            self.state = LifecycleState.RUNNING
             return
         if self.state is not LifecycleState.STOPPING:
             return
