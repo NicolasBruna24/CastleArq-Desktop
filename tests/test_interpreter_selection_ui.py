@@ -123,3 +123,34 @@ def test_cancel_keeps_a_previously_saved_selection(window, fake_settings, monkey
 def test_window_never_imports_or_launches_core(window) -> None:
     assert "castlearq" not in sys.modules
     assert "castlearq.main" not in sys.modules
+
+
+def test_updates_import_failure_uses_fallback(app, fake_settings, monkeypatch) -> None:
+    """ImportError on the optional Updates module keeps the planned fallback."""
+    import sys
+
+    import castlearq_desktop.ui.main_window as main_window_mod
+
+    monkeypatch.setitem(sys.modules, "castlearq_desktop.ui.updates_section", None)
+    # Ensure the stale binding is not reused: the import runs inside __init__.
+    window = main_window_mod.MainWindow(
+        interpreter_settings=InterpreterSettingsStore(fake_settings))
+    try:
+        assert window._update_controller is None
+        assert window._updates_section.text() == "Updates unavailable."
+    finally:
+        window.close()
+
+
+def test_updates_construction_error_propagates(app, fake_settings, monkeypatch) -> None:
+    """A build-time error is not swallowed by the import fallback."""
+    import castlearq_desktop.ui.main_window as main_window_mod
+    import castlearq_desktop.ui.updates_section as updates_mod
+
+    def _broken(*args, **kwargs):
+        raise RuntimeError("construction blew up")
+
+    monkeypatch.setattr(updates_mod, "UpdatesSection", _broken)
+    with pytest.raises(RuntimeError, match="construction blew up"):
+        main_window_mod.MainWindow(
+            interpreter_settings=InterpreterSettingsStore(fake_settings))

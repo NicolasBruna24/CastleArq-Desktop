@@ -33,6 +33,7 @@ import os
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
     QFileDialog,
+    QGroupBox,
     QLabel,
     QMainWindow,
     QPushButton,
@@ -132,6 +133,33 @@ class MainWindow(QMainWindow):
         self._start_button.clicked.connect(self._on_start)
         layout.addWidget(self._start_button)
         layout.addWidget(self._status_label)
+
+        # Settings → Updates (Stage 3): minimal section, no navigation change.
+        settings_box = QGroupBox("Settings", self)
+        settings_layout = QVBoxLayout(settings_box)
+        updates_title = QLabel("Actualizaciones")
+        updates_title.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        settings_layout.addWidget(updates_title)
+        try:
+            from castlearq_desktop.core.update_check_controller import (
+                UpdateCheckController,
+            )
+            from castlearq_desktop.ui.updates_section import UpdatesSection
+        except ImportError:  # Updates section is optional
+            self._update_controller = None
+            self._updates_section = QLabel("Updates unavailable.")
+        else:
+            self._update_controller = UpdateCheckController(
+                interpreter_settings=self._interpreter_settings,
+                parent=self,
+            )
+            self._updates_section = UpdatesSection(
+                controller=self._update_controller, parent=settings_box
+            )
+        settings_layout.addWidget(self._updates_section)
+        layout.addWidget(settings_box)
         layout.addStretch(1)
 
         self.setCentralWidget(central)
@@ -227,6 +255,12 @@ class MainWindow(QMainWindow):
         application exits only after the controller emits its terminal outcome.
         """
         controller = self._controller
+        updater = getattr(self, "_update_controller", None)
+        if updater is not None:
+            try:
+                updater.invalidate()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
         if controller is not None and not controller.shutdown_complete:
             controller.request_shutdown()
             event.ignore()
