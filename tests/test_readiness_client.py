@@ -387,6 +387,9 @@ class FakeReply:
         self.finished = FakeSignal()
         self._error = QNetworkReply.NetworkError.NoError
         self._status = None
+        self._body = b""
+        self._declared_length = None
+        self.read_calls = 0
         self.aborted = False
 
     def error(self):
@@ -396,6 +399,13 @@ class FakeReply:
         if attr == QNetworkRequest.Attribute.HttpStatusCodeAttribute:
             return self._status
         return None
+
+    def readAll(self):
+        self.read_calls += 1
+        return self._body
+
+    def header(self, _kind):
+        return self._declared_length
 
     def abort(self):
         self.aborted = True

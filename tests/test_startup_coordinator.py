@@ -35,6 +35,14 @@ from castlearq_desktop.core.startup_coordinator import manager_liveness
 
 ABS_PYTHON = "/abs/env/bin/python"
 
+#: Test-only admitted version used by these doubles (not production).
+TEST_VERSION = "9.9.9-test"
+
+
+def _health_body(version=TEST_VERSION):
+    import json
+    return json.dumps({"version": version}).encode()
+
 
 class FakeSettings:
     def __init__(self):
@@ -150,6 +158,11 @@ def make_coordinator(popen, **kwargs):
     kwargs.setdefault("timer_factory", FakeTimer)
     kwargs.setdefault("validator", lambda python: valid_outcome(python))
     kwargs.setdefault("api_contract", VersionAdmission.ADMITTED)
+    # DEC-A dynamics are active in the coordinator: these pre-existing
+    # doubles exercise 2xx/liveness, so they inject a matching
+    # installed-version provider plus an explicit test-only allowlist.
+    kwargs.setdefault("installed_version_provider", lambda: TEST_VERSION)
+    kwargs.setdefault("supported_versions", frozenset({TEST_VERSION}))
     coord = CoreStartupCoordinator(settings=settings, **kwargs)
     return coord, clock
 
@@ -159,7 +172,7 @@ def make_transport(script):
 
     def _transport(path, *, timeout):
         calls.append({"path": path, "timeout": timeout})
-        action = script.get(path, HttpProbeResponse(200))
+        action = script.get(path, HttpProbeResponse(200, _health_body()))
         if isinstance(action, Exception):
             raise action
         return action
@@ -234,9 +247,11 @@ def test_error_codes_propagate_by_stage():
     from castlearq_desktop.core.contracts import HEALTH_PATH
     coord, _ = make_coordinator(AlivePopen())
     coord.launch()
-    coord.transport = make_transport({HEALTH_PATH: HttpProbeResponse(503)})
+    coord.transport = make_transport({HEALTH_PATH: HttpProbeResponse(
+        503, _health_body())})
     out = coord.check_readiness_once(now=0.0)
     assert out.ready is False
+    # Version matches and is allowlisted, so only the health stage fails.
     assert out.error_code is ErrorCode.HEALTH_CHECK_FAILED
 
 
@@ -432,6 +447,14 @@ class QtFakeReply:
         self._error = QNetworkReply.NetworkError.ProtocolFailure
         self._status = status
         self.finished.emit()
+
+    def readAll(self):
+        # DEC-A: the Qt transport reads the /health body via readAll() to
+        # extract the top-level "version". This double returns a well-formed
+        # body whose version matches the installed version simulated by
+        # make_coordinator, so admission is evaluated for real rather than
+        # short-circuited by an absent body.
+        return _health_body()
 
 
 class QtFakeNAM:

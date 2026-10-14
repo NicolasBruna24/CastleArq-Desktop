@@ -49,7 +49,7 @@ No threads/executors are introduced to work around this.
 from __future__ import annotations
 
 from dataclasses import dataclass
-from typing import Any, Callable, Dict, List, Mapping, Optional
+from typing import Any, Callable, Dict, FrozenSet, List, Mapping, Optional
 from urllib import request as _urllib_request
 from urllib.error import HTTPError as _UrllibHTTPError
 from urllib.error import URLError as _UrllibURLError
@@ -70,6 +70,9 @@ from castlearq_desktop.core.contracts import ReadinessObservations
 from castlearq_desktop.core.contracts import ReadinessOutcome
 from castlearq_desktop.core.contracts import VersionAdmission
 from castlearq_desktop.core.contracts import evaluate_readiness
+from castlearq_desktop.core.version_admission import MAX_HEALTH_BODY_BYTES
+from castlearq_desktop.core.version_admission import SUPPORTED_CORE_VERSIONS
+from castlearq_desktop.core.version_admission import evaluate_version_admission
 from castlearq_desktop.core.contracts import is_http_success
 
 #: Approved probe order for one readiness pass.
@@ -143,9 +146,17 @@ def urllib_transport(base_url: str) -> Callable[..., HttpProbeResponse]:
         url = base_url.rstrip("/") + path
         try:
             with _urllib_request.urlopen(url, timeout=max(0.0, float(timeout))) as resp:
-                return HttpProbeResponse(status=int(resp.status), body=None)
+                try:
+                    raw = resp.read(MAX_HEALTH_BODY_BYTES + 1)
+                except Exception:
+                    raw = None
+                return HttpProbeResponse(status=int(resp.status), body=raw)
         except _UrllibHTTPError as exc:
-            return HttpProbeResponse(status=int(exc.code), body=None)
+            try:
+                raw = exc.read(MAX_HEALTH_BODY_BYTES + 1)
+            except Exception:
+                raw = None
+            return HttpProbeResponse(status=int(exc.code), body=raw)
         except Exception as exc:
             name = type(exc).__name__
             if isinstance(exc, TimeoutError) or name in (
@@ -170,6 +181,8 @@ class ReadinessHttpClient:
         child_observer: Optional[Callable[[], Optional[bool]]] = None,
         child_alive_before: Optional[bool] = None,
         child_alive_after: Optional[bool] = None,
+        installed_version_provider: Optional[Callable[[], Any]] = None,
+        supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS,
     ) -> None:
         assert TRANSPORT_RETRIES_ENABLED is False
         if (child_observer is not None
@@ -187,6 +200,8 @@ class ReadinessHttpClient:
         # No default simulates confirmed liveness: explicit True required.
         self._child_alive_before = child_alive_before
         self._child_alive_after = child_alive_after
+        self._installed_version_provider = installed_version_provider
+        self._supported_versions = supported_versions
 
     @property
     def base_url(self) -> str:
@@ -227,6 +242,25 @@ class ReadinessHttpClient:
             return self._child_alive_before
         return self._child_alive_after
 
+    def _resolve_contract(self, health_body: Any) -> VersionAdmission:
+        """Resolve DEC-A admission for one pass (fail-closed).
+
+        When no installed-version provider is configured, the explicit
+        ``api_contract`` input is preserved (existing contract/tests). When
+        a provider is configured, DEC-A is evaluated from the installed
+        version and the observed /health body; the static input is not
+        consulted for that pass.
+        """
+        if self._installed_version_provider is None:
+            return self._api_contract
+        try:
+            installed = self._installed_version_provider()
+        except Exception:
+            installed = None
+        return evaluate_version_admission(
+            installed, health_body,
+            supported_versions=self._supported_versions)
+
     @staticmethod
     def _to_predicate(value: Optional[bool]) -> bool:
         # Only explicit True counts as observed-alive; False/None fail closed.
@@ -244,6 +278,7 @@ class ReadinessHttpClient:
         attempts: List[ProbeAttempt] = []
         failed: List[tuple] = []
         overrun = False
+        health_body: Any = None
         alive_before = self._observe_child("before")
         for path in READINESS_PROBE_PATHS:
             if deadline is not None and not deadline.may_start_request(current):
@@ -280,9 +315,13 @@ class ReadinessHttpClient:
                 overrun = True
             attempts.append(ProbeAttempt(path=path, timeout=timeout, status=status))
             observations[path] = ProbeObservation(path=path, status=status)
+            if path == HEALTH_PATH:
+                health_body = (
+                    response.body if response is not None else None)
             if not is_http_success(status):
                 failed.append((path, "status"))
         alive_after = self._observe_child("after")
+        contract = self._resolve_contract(health_body)
         readiness = evaluate_readiness(
             ReadinessObservations(
                 child_alive_before=self._to_predicate(alive_before),
@@ -290,7 +329,7 @@ class ReadinessHttpClient:
                 models=observations.get(MODELS_PATH),
                 artifacts=observations.get(ARTIFACTS_PATH),
                 child_alive_after=self._to_predicate(alive_after),
-                api_contract=self._api_contract,
+                api_contract=contract,
             )
         )
         code = self._classify(readiness, failed, overrun=overrun)

@@ -33,11 +33,16 @@ runtime side effects.
 
 Isolation guarantees:
 * loopback-only server on an ephemeral port (no fixed port, no public bind);
-* no external network, no real Core process, no persistent files, no user
-  settings changes;
-* DEC-A is never approved: the production default ``VersionAdmission.NOT_EVALUATED``
-  remains fail-closed. A single, clearly-isolated case uses a test-only
-  ``ADMITTED`` value purely to exercise the transport's successful path;
+* no external network, no persistent files, no user settings changes; the
+  authorized DEC-A real-Core case uses only the isolated local Core 0.5.1
+  interpreter against the loopback production endpoint;
+* DEC-A stays fail-closed by default: the production static input
+  ``VersionAdmission.NOT_EVALUATED`` never approves by itself. A single,
+  clearly-isolated case uses a test-only ``ADMITTED`` value purely to
+  exercise the transport's successful path; the authorized real-Core case
+  obtains ``ADMITTED`` only through the real production policy (the really
+  installed 0.5.1 matched against Core's real ``/health`` version and the
+  real allowlist);
 * every asynchronous wait is bounded by a watchdog; every owned resource has an
   explicit, bounded cleanup path in ``finally`` blocks.
 
@@ -48,18 +53,23 @@ reported as proof of a production shutdown outcome.
 from __future__ import annotations
 
 import os
+import socket
 import sys
 import time
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from threading import Event, Thread
+from urllib import request as _urlrequest
 
 import pytest
 
 from PySide6.QtCore import QCoreApplication, QEventLoop, QTimer
 
+from castlearq_desktop.core.contracts import ARTIFACTS_PATH, HEALTH_PATH, MODELS_PATH
 from castlearq_desktop.core.contracts import Deadline, VersionAdmission
 from castlearq_desktop.core.contracts import ErrorCode, ReadinessCondition
+from castlearq_desktop.core.contracts import is_http_success
 from castlearq_desktop.core.contracts.interpreter import ValidationOutcome
+from castlearq_desktop.core.contracts.port_conflict import CORE_HOST, CORE_PORT
 from castlearq_desktop.core.interpreter_settings import InterpreterSettingsStore
 from castlearq_desktop.core.lifecycle_manager import LifecycleManager, LifecycleState
 from castlearq_desktop.core.lifecycle_observer import LifecycleObserver
@@ -71,6 +81,11 @@ from castlearq_desktop.core.readiness_qt_transport import (
 from castlearq_desktop.core.startup_controller import MonotonicClock, StartupController
 from castlearq_desktop.core.startup_coordinator import CoreStartupCoordinator
 from castlearq_desktop.core.subprocess_adapter import SubprocessProcessAdapter
+from castlearq_desktop.core.version_admission import MAX_HEALTH_BODY_BYTES
+from castlearq_desktop.core.version_admission import SUPPORTED_CORE_VERSIONS
+from castlearq_desktop.core.version_admission import evaluate_version_admission
+from castlearq_desktop.core.version_admission import extract_health_version
+from castlearq_desktop.core.version_admission import query_installed_core_version
 from PySide6.QtNetwork import QNetworkReply
 
 #: Opt-in gate: runtime integration tests run only when this equals "1".
@@ -729,6 +744,203 @@ def test_tc7_cancel_readiness_during_shutdown(monkeypatch):
         stop_server(server, thread, stop_event)
 
 
+# --- DEC-A: real Core 0.5.1 on the production base URL (127.0.0.1:8000) -----
+# Implements the previously deferred coordinator-level readiness case under
+# explicit authorization, in its positive form: real isolated Core
+# interpreter, real coordinator, real Qt transport + QNetworkAccessManager,
+# real production allowlist (admitting exactly 0.5.1).  Nothing
+# version-related is injected: no ADMITTED admission, no installed-version
+# provider, no allowlist substitution, no base-URL monkeypatch, no fake
+# transport; ADMITTED is produced only by the real production policy.
+# =============================================================================
+
+#: Real isolated interpreter holding exactly ``castlearq==0.5.1`` (Python 3.14).
+CORE_PYTHON = "/home/brunapc/.venvs/arq-int-0.5.1/bin/python"
+
+
+def make_recording_popen_factory(created):
+    """Return a ``popen_factory`` that launches the REAL command unchanged.
+
+    Unlike :func:`make_popen_factory` (which substitutes a purpose-built test
+    script), this wrapper forwards ``argv`` and every keyword argument verbatim
+    to ``subprocess.Popen`` and only records the created child so the test can
+    verify cleanup.  The coordinator's real launch command executes as-is; no
+    production code is changed.
+    """
+
+    def factory(*args, **kwargs):
+        proc = __import__("subprocess").Popen(*args, **kwargs)
+        created.append(proc)
+        return proc
+
+    return factory
+
+
+def _port_is_free(host, port):
+    """Runtime check that *(host, port)* has no listener right now.
+
+    ``SO_REUSEADDR`` mirrors the production server's own socket flag, so
+    lingering ``TIME_WAIT`` entries never read as occupancy while an actual
+    listening socket still fails the bind.
+    """
+    probe = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
+    try:
+        probe.setsockopt(socket.SOL_SOCKET, socket.SO_REUSEADDR, 1)
+        probe.bind((host, port))
+        return True
+    except OSError:
+        return False
+    finally:
+        probe.close()
+
+
+def test_dec_a_admitted_real_core_reaches_ready():
+    """DEC-A: real Core 0.5.1 is admitted and readiness really succeeds.
+
+    Launches real CastleArq Core 0.5.1 through the real coordinator (real
+    validator, real ``subprocess.Popen``), runs readiness over the real Qt
+    transport against the production base URL ``http://127.0.0.1:8000``, and
+    lets the real production policy decide admission: the really-installed
+    ``0.5.1`` (resolved by the production installed-version mechanism),
+    matched against Core's real ``/health`` version and the real production
+    allowlist, must evaluate to ``ADMITTED`` and the coordinator must really
+    reach READY.  Cleanup is verified: no test-owned child remains and the
+    production port is released.
+    """
+    _require_runtime_it()
+    app = _app()
+
+    # Preconditions, before any process is launched (DEC-A decision + port).
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1"}), (
+        "this case encodes the authorized admission of 0.5.1; revisit it "
+        "together with the production allowlist decision")
+    if not os.path.isfile(CORE_PYTHON):
+        pytest.skip(f"real Core interpreter missing: {CORE_PYTHON}")
+    assert _port_is_free(CORE_HOST, CORE_PORT), (
+        f"production port {CORE_HOST}:{CORE_PORT} must be free before the "
+        "real Core launch")
+
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save(CORE_PYTHON)
+    created = []
+    # Production-shaped coordinator: the validator (real A1 diagnostic), the
+    # recording popen factory (real subprocess.Popen), the production static
+    # api_contract and the real Qt timer factory; installed-version provider
+    # and supported versions stay at their real defaults (real query / real
+    # allowlist admitting 0.5.1), and qt_nam=None makes the transport build a
+    # real QNetworkAccessManager internally.
+    coord = CoreStartupCoordinator(
+        settings=settings,
+        clock=MonotonicClock(),
+        popen_factory=make_recording_popen_factory(created),
+        timer_factory=QTimer,
+    )
+    # No-injection evidence: nothing version-related was substituted.
+    assert coord.validator is None
+    assert coord.installed_version_provider is None
+    assert coord.supported_versions is SUPPORTED_CORE_VERSIONS
+    assert coord.api_contract is VersionAdmission.NOT_EVALUATED
+    assert coord.qt_nam is None
+
+    controller = StartupController(coord)  # real shutdown path (TC-5 style)
+    terminals = []
+    controller.shutdown_finished.connect(terminals.append)
+    results, passes = [], []
+    checker = None
+    try:
+        # --- 1) real Core launch through the real coordinator ---------------
+        result = coord.launch()
+        assert result.status in ("ok", "pending"), (
+            f"real Core launch failed: {result.detail} / {result.context}")
+        assert coord.spawn_calls == 1, "exactly one real spawn"
+        assert created, "the real adapter must have created the child"
+        assert coord.manager.state is LifecycleState.RUNNING, (
+            f"real Core must be RUNNING (state={coord.manager.state})")
+
+        # --- 2) real installed-version resolution (real mechanism) ----------
+        installed = query_installed_core_version(CORE_PYTHON)
+        assert installed == "0.5.1", f"real installed version: {installed!r}"
+
+        # --- 3) real Qt transport against the production base URL -----------
+        # check_readiness_async builds the real QtReadinessTransport over
+        # default_base_url() (http://127.0.0.1:8000) with a real
+        # QNetworkAccessManager, the real installed-version provider and the
+        # real allowlist — the production readiness path as-is.
+        checker = coord.check_readiness_async()
+        # Test-only observation hook (read-only): the checker owns the
+        # transport and exposes no public per-pass signal at this level.
+        checker._transport.progress.connect(passes.append)
+        checker.result.connect(results.append)
+
+        assert _wait_terminal(app, results, 28.0), (
+            "readiness must reach a terminal outcome within the harness "
+            "watchdog (the real global deadline is 20 s)")
+        assert len(results) == 1, "exactly one terminal readiness outcome"
+        terminal = results[0]
+
+        # --- 4) the coordinator really reaches READY ------------------------
+        assert terminal.ready is True, (
+            f"coordinator must reach READY (error={terminal.error_code!r})")
+        assert terminal.error_code is None
+        assert terminal.deadline_expired is False
+
+        # --- 5) evidence: READY implies every real condition held ------------
+        # The terminal outcome carries no failures, and only an ADMITTED
+        # dynamic admission can establish readiness (DEC-A/DEC-B invariant):
+        # all three endpoints really answered 2xx, the child stayed alive
+        # around them, and the real production policy admitted the version
+        # (the static input stayed NOT_EVALUATED).
+        assert terminal.outcome.ready is True
+        assert not terminal.outcome.failures, terminal.outcome.failures
+        assert coord._last_readiness_result is terminal
+
+        # Harness observation (never part of the readiness decision): read
+        # the real server directly to record the exact evidence — /health
+        # really answers HTTP 200 with "version": "0.5.1", and the other two
+        # approved endpoints answer 2xx.
+        base = f"http://{CORE_HOST}:{CORE_PORT}"
+        with _urlrequest.urlopen(base + HEALTH_PATH, timeout=4.0) as response:
+            assert response.status == 200
+            health_raw = response.read(MAX_HEALTH_BODY_BYTES)
+        assert extract_health_version(health_raw) == (True, "0.5.1")
+        for path in (MODELS_PATH, ARTIFACTS_PATH):
+            with _urlrequest.urlopen(base + path, timeout=4.0) as response:
+                assert is_http_success(response.status), (path,
+                                                          response.status)
+        # The production admission function, run over the real inputs only
+        # (really-installed version resolved in step 2, real /health body,
+        # real allowlist default), independently yields ADMITTED.
+        assert evaluate_version_admission(
+            installed, health_raw) is VersionAdmission.ADMITTED
+
+        # --- 6) cleanup: production shutdown, child gone, port released -----
+        t0 = time.monotonic()
+        controller.request_shutdown()  # must return immediately (non-blocking)
+        assert (time.monotonic() - t0) < 1.0, "request_shutdown must not block"
+        assert _wait_terminal(app, terminals, 12.0), \
+            "a terminal shutdown outcome must arrive"
+        assert terminals == [LifecycleState.STOPPED], terminals
+        assert _wait_state(app, lambda: created[0].poll() is not None, 5.0), \
+            "the real Core child must be reaped"
+        _pump(app, 0.3)
+        assert _port_is_free(CORE_HOST, CORE_PORT), (
+            "the production port must be released after shutdown")
+    finally:
+        if checker is not None:
+            try:
+                checker.stop()  # idempotent: inert after the terminal result
+            except Exception:
+                pass
+        if coord.observer is not None:
+            coord.observer.stop()
+        # Bounded teardown for early assertion failures (TC-5 guarantees a
+        # repeated shutdown request after a terminal outcome is inert).
+        if created and created[0].poll() is None:
+            controller.request_shutdown()
+            _wait_terminal(app, terminals, 8.0)
+        for proc in created:
+            emergency_reap(proc)
+
 # --- explicitly deferred cases (not implemented here) ------------------------
 #
 # TC-9 (unconfirmed shutdown / unknown process status): a real OS subprocess
@@ -740,7 +952,17 @@ def test_tc7_cancel_readiness_during_shutdown(monkeypatch):
 # cover the unknown-status path.
 #
 # Coordinator-level readiness against the production default base URL
-# (127.0.0.1:8000): deferred per the port-8000 safety rule — safe use of
-# port 8000 cannot be established without a runtime check, the port may be
-# occupied, and no base-URL injection parameter may be added to production
-# code.  TC-7 uses a test-local monkeypatch instead of touching that port.
+# (127.0.0.1:8000): covered above by
+# ``test_dec_a_admitted_real_core_reaches_ready`` (authorized real case:
+# runtime port-free check, real isolated Core 0.5.1, real production
+# allowlist admitting exactly 0.5.1, verified cleanup).  TC-7 keeps using a
+# test-local monkeypatch so the shutdown-cancellation path never depends on
+# that port.
+#
+# Rejection of a *non-admitted* version is deliberately not represented
+# against a real Core: the only authorized real environment reports 0.5.1,
+# which the production allowlist now admits, and producing any other version
+# (a second package environment, a fake /health server, or an overridden
+# allowlist) would falsify the production path under test.  The fail-closed
+# UNKNOWN rejection stays covered by the deterministic unit suite
+# (tests/test_version_admission.py with explicit test-only allowlists).

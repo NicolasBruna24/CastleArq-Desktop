@@ -33,6 +33,7 @@ import os
 import sys
 import time
 from types import SimpleNamespace
+from typing import Optional
 
 import pytest
 
@@ -65,6 +66,15 @@ from castlearq_desktop.core.startup_coordinator import (  # noqa: E402
 from castlearq_desktop.ui.main_window import MainWindow  # noqa: E402
 
 ABS_PYTHON = "/abs/env/bin/python"
+
+#: Test-only admitted version used by the Qt readiness doubles (not production).
+TEST_VERSION = "9.9.9-test"
+
+
+def _health_body(version: str = TEST_VERSION) -> bytes:
+    """Well-formed /health body whose top-level ``version`` is *version*."""
+    import json
+    return json.dumps({"version": version}).encode()
 
 
 class FakeSettings:
@@ -203,6 +213,16 @@ class QtFakeReply:
         self._status = status
         self.finished.emit()
 
+    def readAll(self):
+        # DEC-A: the Qt transport reads the /health body via readAll() to
+        # extract the top-level "version". Returning a well-formed body lets
+        # admission be evaluated for real instead of short-circuiting to
+        # MISSING on an absent body. Only tests that also inject an
+        # installed-version provider consult it; tests that rely on the
+        # static ``api_contract`` input (e.g. the fail-closed case) keep
+        # that input untouched, since no provider is configured for them.
+        return _health_body()
+
 
 class QtFakeNAM:
     def __init__(self) -> None:
@@ -225,14 +245,28 @@ def qt_app():
     return QApplication.instance() or QApplication(sys.argv[:1])
 
 
-def build(popen, *, api_contract=VersionAdmission.ADMITTED):
-    """Construct a coordinator + controller wired with two timer registries."""
+def build(popen, *, api_contract=VersionAdmission.ADMITTED,
+          admitted_version: Optional[str] = TEST_VERSION):
+    """Construct a coordinator + controller wired with two timer registries.
+
+    When *admitted_version* is given, DEC-A is driven for real: an
+    installed-version provider plus an explicit test-only allowlist are
+    injected, and the Qt double's /health body reports that same version, so
+    admission is genuinely evaluated rather than assumed. Pass
+    ``admitted_version=None`` to leave the static ``api_contract`` input in
+    force (used by the fail-closed test, which asserts readiness never
+    succeeds because admission was not evaluated).
+    """
     settings = InterpreterSettingsStore(FakeSettings())
     settings.save(ABS_PYTHON)
     clock = FakeClock()
     coord_reg: list = []
     ctrl_reg: list = []
     nam = QtFakeNAM()
+    admission_kwargs = {}
+    if admitted_version is not None:
+        admission_kwargs["installed_version_provider"] = lambda: admitted_version
+        admission_kwargs["supported_versions"] = frozenset({admitted_version})
     coordinator = CoreStartupCoordinator(
         settings=settings,
         clock=clock,
@@ -241,6 +275,7 @@ def build(popen, *, api_contract=VersionAdmission.ADMITTED):
         validator=valid_outcome,
         api_contract=api_contract,
         qt_nam=nam,
+        **admission_kwargs,
     )
     controller = StartupController(coordinator,
                                    timer_factory=lambda: FakeTimer(ctrl_reg))
@@ -307,7 +342,8 @@ def test_stale_readiness_result_suppressed():
 
 
 def test_fail_closed_when_admission_not_evaluated():
-    b = build(FakePopen(), api_contract=VersionAdmission.NOT_EVALUATED)
+    b = build(FakePopen(), api_contract=VersionAdmission.NOT_EVALUATED,
+              admitted_version=None)
     results = []
     b.controller.readiness_result.connect(lambda r: results.append(r))
     b.controller.start()

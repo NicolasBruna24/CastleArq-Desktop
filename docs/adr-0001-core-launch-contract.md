@@ -123,6 +123,40 @@ implementation details still to be finalized before or during a separately
 authorized implementation-planning step. This ADR deliberately does **not**
 invent a compatibility matrix.
 
+### D5.1 — Conservative admission DEC-A (ratified 2026-10-13)
+
+DEC-A implements the D5 policy conservatively (fail-closed, existing
+`API_CONTRACT_INCOMPATIBLE` vocabulary, no new error code):
+
+- The installed `castlearq` distribution version is obtained with **only**
+  the explicitly selected interpreter (isolated `-I` stdlib
+  `importlib.metadata` probe; absolute path, no PATH fallback, no
+  alternative interpreter).
+- The Core version is the top-level `version` string field of the
+  `GET /health` JSON object (user-confirmed shape 2026-10-13). Any HTTP
+  error, invalid JSON, non-object body, or missing/invalid field fails
+  closed.
+- Both versions must be valid **and equal**, and the matched version must
+  belong to the centralized allowlist `SUPPORTED_CORE_VERSIONS`
+  (`src/castlearq_desktop/core/version_admission.py`).
+- The allowlist was initially **empty** (user decision 2026-10-13): no
+  version admitted `READY` and `0.5.1` was a pending candidate under real
+  verification.
+- Update (user decision 2026-10-13, since validated): after real
+  verification against an isolated Core `0.5.1` installation (installed
+  version equals the `/health` version across launch/readiness, plus
+  readiness success), `0.5.1` was explicitly admitted; the allowlist now
+  contains exactly `0.5.1` and no other version. Admission is
+  exact-version only — no ranges, no wildcards — and no other Core
+  version, including newer releases, is automatically compatible.
+- Automated tests (doubles + explicit test-only allowlist entries) remain
+  isolated verification of the policy logic. Admitting any new version
+  requires real verification against an actual Core install, then an
+  explicit allowlist addition; until that happens every other version
+  stays fail-closed. DEC-A has been positively validated against a real
+  Core `0.5.1` installation through the opt-in runtime integration
+  suite (real coordinator, real Qt transport, real allowlist).
+
 ### D6 — No Core changes
 
 These decisions apply to the Desktop integration boundary only. They do **not**

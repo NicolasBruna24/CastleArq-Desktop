@@ -29,7 +29,7 @@ False; START_FAILED without owned handle → False; anything else → None
 from __future__ import annotations
 
 from dataclasses import dataclass, field
-from typing import Any, Callable, Optional
+from typing import Any, Callable, FrozenSet, Optional
 
 from castlearq_desktop.core.contracts import Deadline
 from castlearq_desktop.core.contracts import ErrorCode
@@ -43,6 +43,8 @@ from castlearq_desktop.core.readiness_client import HttpProbeResponse
 from castlearq_desktop.core.readiness_client import ReadinessHttpClient
 from castlearq_desktop.core.readiness_client import ReadinessWaitResult
 from castlearq_desktop.core.subprocess_adapter import SubprocessProcessAdapter
+from castlearq_desktop.core.version_admission import SUPPORTED_CORE_VERSIONS
+from castlearq_desktop.core.version_admission import query_installed_core_version
 
 
 def manager_liveness(manager: LifecycleManager) -> Optional[bool]:
@@ -69,12 +71,21 @@ class CoreStartupCoordinator:
     validator: Optional[Callable[..., Any]] = None
     popen_factory: Optional[Callable[..., Any]] = None
     api_contract: VersionAdmission = VersionAdmission.NOT_EVALUATED
+    installed_version_provider: Optional[Callable[[], Any]] = None
+    version_executor: Optional[Callable[..., Any]] = None
+    supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS
     manager: Optional[LifecycleManager] = None
     qt_nam: Optional[Any] = None
     observer: Optional[LifecycleObserver] = field(default=None, init=False)
     spawn_calls: int = field(default=0, init=False)
     _last_readiness_result: Optional[Any] = field(default=None, init=False)
     _last_readiness_error: Optional[Any] = field(default=None, init=False)
+    # M1: installed-version resolution cache, at most one subprocess per
+    # startup attempt. ``_version_cache_valid`` marks whether
+    # ``_cached_installed_version`` belongs to the current attempt; every
+    # accepted launch resets it so no value leaks across attempts.
+    _cached_installed_version: Optional[str] = field(default=None, init=False)
+    _version_cache_valid: bool = field(default=False, init=False)
 
     def _ensure_manager(self) -> LifecycleManager:
         if self.manager is None:
@@ -117,6 +128,11 @@ class CoreStartupCoordinator:
                                    state=LifecycleState.NOT_STARTED,
                                    error=error, detail=str(error),
                                    context=dict(error.technical_context))
+        # M1: a new attempt starts here (validation passed, a launch outcome
+        # — accepted, refused, or failed — is about to be produced). Reset
+        # the version cache so the previous attempt's value never leaks.
+        self._version_cache_valid = False
+        self._cached_installed_version = None
         manager = self._ensure_manager()
         result = manager.start(python)
 
@@ -127,6 +143,39 @@ class CoreStartupCoordinator:
             self._ensure_observer().start()
 
         return result
+
+    def _installed_version(self) -> Optional[str]:
+        """Return installed castlearq version for the current attempt.
+
+        Resolved at most once per startup attempt and reused across all
+        readiness passes of that attempt (M1). The first call resolves via
+        the injected provider (tests) or via the validated configured
+        interpreter; later calls reuse the cached outcome — including
+        ``None`` (resolution failure stays fail-closed, never retried
+        into a valid version within the same attempt).
+        """
+        if self._version_cache_valid:
+            return self._cached_installed_version
+        self._version_cache_valid = True
+        if self.installed_version_provider is not None:
+            try:
+                value = self.installed_version_provider()
+            except Exception:
+                value = None
+            self._cached_installed_version = (
+                value if isinstance(value, str) else None)
+            return self._cached_installed_version
+        try:
+            python = self.settings.load()
+        except Exception:
+            self._cached_installed_version = None
+            return None
+        if not python:
+            self._cached_installed_version = None
+            return None
+        self._cached_installed_version = query_installed_core_version(
+            python, execute=self.version_executor)
+        return self._cached_installed_version
 
     def check_readiness_once(
         self,
@@ -139,7 +188,9 @@ class CoreStartupCoordinator:
         assert manager is not None
         client = ReadinessHttpClient(
             transport=self.transport, clock=self.clock, sleeper=self.sleeper,
-            api_contract=self.api_contract, child_observer=self._liveness)
+            api_contract=self.api_contract, child_observer=self._liveness,
+            installed_version_provider=self._installed_version,
+            supported_versions=self.supported_versions)
         start = self.clock.monotonic() if now is None else float(now)
         active = deadline if deadline is not None else Deadline.starting_now(start)
         return client.probe_once(now=start, deadline=active)
@@ -155,7 +206,9 @@ class CoreStartupCoordinator:
         assert manager is not None
         client = ReadinessHttpClient(
             transport=self.transport, clock=self.clock, sleeper=self.sleeper,
-            api_contract=self.api_contract, child_observer=self._liveness)
+            api_contract=self.api_contract, child_observer=self._liveness,
+            installed_version_provider=self._installed_version,
+            supported_versions=self.supported_versions)
         start = self.clock.monotonic() if now is None else float(now)
         active = deadline if deadline is not None else Deadline.starting_now(start)
         return client.wait_until_ready(now=start, deadline=active)
@@ -202,6 +255,8 @@ class CoreStartupCoordinator:
             clock=self.clock,
             timer_factory=timer_factory,
             nam=self.qt_nam,
+            installed_version_provider=self._installed_version,
+            supported_versions=self.supported_versions,
         )
         checker = QtReadinessChecker(transport)
         checker.result.connect(self._on_readiness_result)

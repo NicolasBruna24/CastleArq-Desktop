@@ -37,7 +37,7 @@ detected and classified as ``READINESS_TIMEOUT`` instead of success.
 
 from __future__ import annotations
 
-from typing import Any, Callable, List, Optional, Tuple
+from typing import Any, Callable, FrozenSet, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
@@ -60,6 +60,9 @@ from castlearq_desktop.core.readiness_client import (
     ReadinessProbeResult,
     ReadinessWaitResult,
 )
+from castlearq_desktop.core.version_admission import MAX_HEALTH_BODY_BYTES
+from castlearq_desktop.core.version_admission import SUPPORTED_CORE_VERSIONS
+from castlearq_desktop.core.version_admission import evaluate_version_admission
 
 #: Approved probe order for one readiness pass (DEC-B).
 READINESS_PROBE_PATHS = (HEALTH_PATH, MODELS_PATH, ARTIFACTS_PATH)
@@ -68,6 +71,27 @@ _NoError = QNetworkReply.NetworkError.NoError
 _Canceled = QNetworkReply.NetworkError.OperationCanceledError
 _ProtocolFailure = QNetworkReply.NetworkError.ProtocolFailure
 _StatusAttr = QNetworkRequest.Attribute.HttpStatusCodeAttribute
+_ContentLengthAttr = getattr(
+    QNetworkRequest.Attribute, "ContentLengthAttribute",
+    "Content-Length")
+
+
+def _declared_content_length(reply: Any) -> Optional[int]:
+    """Best-effort declared length; None when absent/unparseable (untrusted)."""
+    try:
+        raw = reply.header(QNetworkRequest.KnownHeaders.ContentLengthHeader)
+    except Exception:
+        raw = None
+    if raw is None and _ContentLengthAttr is not None:
+        try:
+            raw = reply.attribute(_ContentLengthAttr)
+        except Exception:
+            raw = None
+    try:
+        length = int(raw)  # type: ignore[arg-type]
+    except (TypeError, ValueError):
+        return None
+    return length if length >= 0 else None
 
 
 def _stage_code(path: str) -> ErrorCode:
@@ -100,6 +124,8 @@ class QtReadinessTransport(QObject):
         clock: Any,
         timer_factory: Callable[[], Any],
         nam: Optional[Any] = None,
+        installed_version_provider: Optional[Callable[[], Any]] = None,
+        supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS,
     ) -> None:
         super().__init__()
         self.base_url = base_url
@@ -108,6 +134,8 @@ class QtReadinessTransport(QObject):
         self._clock = clock
         self._timer_factory = timer_factory
         self._nam = nam if nam is not None else QNetworkAccessManager(self)
+        self._installed_version_provider = installed_version_provider
+        self._supported_versions = supported_versions
 
         self._finished = False
         self._deadline: Optional[Deadline] = None
@@ -166,7 +194,7 @@ class QtReadinessTransport(QObject):
         if self._finished:
             return
         if not self._deadline.may_start_request(now):
-            self._pass_results[path] = ("not_started", None)
+            self._pass_results[path] = ("not_started", None, None)
             self._check_complete()
             return
         timeout = self._deadline.effective_request_timeout(now)
@@ -174,7 +202,7 @@ class QtReadinessTransport(QObject):
         try:
             reply = self._nam.get(request)
         except Exception:  # pragma: no cover - defensive
-            self._pass_results[path] = ("transport_error", None)
+            self._pass_results[path] = ("transport_error", None, None)
             self._check_complete()
             return
         self._active_replies[path] = reply
@@ -198,17 +226,56 @@ class QtReadinessTransport(QObject):
         self._delete_reply(reply)
         self._check_complete()
 
-    def _classify_reply(self, reply: Any) -> Tuple[str, Optional[int]]:
+    def _classify_reply(self, reply: Any) -> Tuple[str, Optional[int], Any]:
         err = reply.error()
         status = reply.attribute(_StatusAttr)
         status = int(status) if status is not None else None
+        body = self._read_reply_body(reply)
         if err == _NoError:
-            return ("ok", status)
+            return ("ok", status, body)
         if err == _Canceled:
-            return ("timeout", None)
+            return ("timeout", None, None)
         if err == _ProtocolFailure and status is not None:
-            return ("http_error", status)
-        return ("transport_error", None)
+            return ("http_error", status, body)
+        return ("transport_error", None, None)
+
+    @staticmethod
+    def _read_reply_body(reply: Any) -> Any:
+        """Best-effort bounded read of a finished reply body (M2).
+
+        Qt's ``QNetworkReply`` offers no pre-materialization byte cap, so a
+        true streaming limit is not available with this API. Mitigation,
+        without weakening fail-closed: (1) when the reply declares a
+        ``Content-Length`` above ``MAX_HEALTH_BODY_BYTES``, skip the read
+        entirely; (2) otherwise read once and discard anything above the
+        cap. Oversize/empty/unreadable bodies therefore yield ``None``,
+        which ``extract_health_version`` maps to absent and the admission
+        policy maps to a non-admitted outcome. No blocking, no new threads.
+        """
+        try:
+            declared = _declared_content_length(reply)
+        except Exception:
+            declared = None
+        if declared is not None and declared > MAX_HEALTH_BODY_BYTES:
+            try:
+                reply.abort()
+            except Exception:
+                pass
+            return None
+        try:
+            read_all = reply.readAll()
+        except Exception:
+            return None
+        try:
+            if hasattr(read_all, "data"):
+                raw = bytes(read_all.data())
+            else:
+                raw = bytes(read_all)
+        except Exception:
+            return None
+        if len(raw) > MAX_HEALTH_BODY_BYTES:
+            return None
+        return raw
 
     def _on_request_timeout(self, path: str, reply: Any) -> None:
         if self._finished:
@@ -235,9 +302,9 @@ class QtReadinessTransport(QObject):
             models=self._to_observation(MODELS_PATH),
             artifacts=self._to_observation(ARTIFACTS_PATH),
             child_alive_after=self._to_predicate(alive_after),
-            api_contract=self._api_contract,
+            api_contract=self._resolve_contract(),
         ))
-        failed = [(p, k) for p, (k, s) in self._ordered_results()
+        failed = [(p, k) for p, (k, s, _b) in self._ordered_results()
                   if not _is_success(k, s)]
         code = self._classify(readiness, failed, overrun=overrun)
         ready = readiness.ready and not overrun
@@ -274,12 +341,32 @@ class QtReadinessTransport(QObject):
     def _to_predicate(value: Optional[bool]) -> bool:
         return value is True
 
-    def _ordered_results(self) -> List[Tuple[str, Tuple[str, Optional[int]]]]:
-        return [(p, self._pass_results.get(p, ("not_started", None)))
+    def _resolve_contract(self) -> VersionAdmission:
+        """Resolve DEC-A admission for one pass (fail-closed)."""
+        if self._installed_version_provider is None:
+            return self._api_contract
+        try:
+            installed = self._installed_version_provider()
+        except Exception:
+            installed = None
+        health_body = self._health_body()
+        return evaluate_version_admission(
+            installed, health_body,
+            supported_versions=self._supported_versions)
+
+    def _health_body(self) -> Any:
+        entry = self._pass_results.get(HEALTH_PATH)
+        if entry is None or len(entry) < 3:
+            return None
+        return entry[2]
+
+    def _ordered_results(self) -> List[Tuple[str, Tuple[str, Optional[int], Any]]]:
+        return [(p, self._pass_results.get(p, ("not_started", None, None)))
                 for p in READINESS_PROBE_PATHS]
 
     def _to_observation(self, path: str) -> ProbeObservation:
-        kind, status = self._pass_results.get(path, ("not_started", None))
+        entry = self._pass_results.get(path, ("not_started", None, None))
+        kind, status = entry[0], entry[1]
         if kind in ("ok", "http_error") and status is not None:
             return ProbeObservation(path=path, status=status)
         return ProbeObservation(path=path, status=None)
@@ -300,6 +387,10 @@ class QtReadinessTransport(QObject):
         return None
 
     def _timeout_result(self) -> ReadinessWaitResult:
+        # Fail-closed diagnostic note: timeout/cancellation/deadline paths
+        # carry no HTTP observations, so there is no /health body to feed
+        # the dynamic DEC-A evaluation; the static api_contract input is
+        # reported as-is (production: NOT_EVALUATED, never ready).
         outcome = evaluate_readiness(ReadinessObservations(
             api_contract=self._api_contract))
         return ReadinessWaitResult(

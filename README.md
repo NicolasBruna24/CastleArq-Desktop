@@ -115,15 +115,41 @@ Timing follows the ratified contract: a 20-second global deadline, at most
 4 seconds per request (always bounded by the remaining global budget), a
 nominal 250 ms polling interval, and no automatic transport retries.
 
-**Compatibility admission is fail-closed, and DEC-A has NOT been approved.**
-Production composition uses `VersionAdmission.NOT_EVALUATED`, and readiness is
-declared only when an API contract has been *explicitly admitted*. A successful
-HTTP response alone can never make production readiness succeed. Selecting an
-authoritative compatibility-admission source and its criteria remains a pending
-user decision; until that decision exists, "Core: ready" is intentionally
-unreachable in production. Test suites exercise the transport's success path
-with clearly isolated, test-only admission values; this neither approves nor
-alters the production policy.
+**Compatibility admission (DEC-A) is fail-closed and conservative.** For
+every readiness pass Desktop:
+
+- queries the installed `castlearq` distribution version using **only** the
+  explicitly selected interpreter (`<python> -I -c` with a stdlib-only
+  `importlib.metadata` probe; absolute path, no PATH fallback, no
+  alternative interpreter);
+- reads the top-level `version` string field of the `GET /health` JSON
+  object (strict syntax; any HTTP error, invalid JSON, non-object body, or
+  missing/invalid field fails closed);
+- requires both versions to be valid **and equal**;
+- requires the matched version to belong to the centralized allowlist
+  `SUPPORTED_CORE_VERSIONS` in `core/version_admission.py`.
+
+Any unknown, mismatched, invalid, or missing version blocks `READY` with
+`API_CONTRACT_INCOMPATIBLE` (existing vocabulary; no new error code), even
+when `/health`, `/v1/models`, and `/v1/artifacts` all return HTTP 2xx.
+Production composition keeps `VersionAdmission.NOT_EVALUATED` as the static
+input; DEC-A dynamics engage through the coordinator's installed-version
+provider, so production `READY` is unreachable until a version is both
+matched and allowlisted.
+
+The allowlist currently contains exactly one version: `0.5.1`, explicitly
+admitted after real verification against an isolated Core `0.5.1`
+installation (installed version equals the `/health` version across
+launch/readiness, plus readiness success — exercised end-to-end by the
+opt-in runtime integration suite, which reaches `READY` with a real Core).
+Admission is exact-version only (no ranges, no wildcards): any other
+version, including newer Core releases from PyPI or GitHub, is not
+automatically compatible and stays fail-closed until it is separately
+verified against an actual Core install (installed version equals the
+`/health` version across launch/readiness, plus readiness success) and
+explicitly added to the allowlist. Automated tests with doubles and an
+explicit test-only allowlist entry remain isolated verification of the
+policy logic.
 
 ## Lifecycle and shutdown
 
@@ -138,8 +164,13 @@ alters the production policy.
   5-second total budget the outcome is `SHUTDOWN_FAILED` and the application
   exits with a non-zero code. No further signals are sent after the deadline.
 - These behaviors are verified with deterministic fakes and with purpose-built
-  short-lived test subprocesses. They have **not** been validated against an
-  actual CastleArq Core installation.
+  short-lived test subprocesses. In addition, the opt-in runtime integration
+  suite (`CASTLEARQ_RUNTIME_IT=1`) launches, readiness-checks, and shuts down
+  a real CastleArq Core `0.5.1` child through the production path
+  (`test_dec_a_admitted_real_core_reaches_ready`). Failure and escalation
+  paths not exercised there — forced-termination escalation, unconfirmed
+  shutdown, unexpected exit — remain covered only by fakes and purpose-built
+  subprocesses.
 
 ## Setup
 
@@ -184,19 +215,31 @@ Two suites exist, with different purposes:
   CASTLEARQ_RUNTIME_IT=1 .venv/bin/python -m pytest -v tests/test_runtime_integration.py
   ```
 
-  These exercise the real Qt event loop, a real `QNetworkAccessManager`
-  against a loopback-only HTTP test server on an ephemeral port, and
-  short-lived purpose-built test subprocesses (never CastleArq Core). They are
-  skipped unless `CASTLEARQ_RUNTIME_IT=1` is set, and they do **not** prove
-  compatibility with an actual CastleArq Core installation.
+  Most cases exercise the real Qt event loop, a real
+  `QNetworkAccessManager` against a loopback-only HTTP test server on an
+  ephemeral port, and short-lived purpose-built test subprocesses (never
+  CastleArq Core). One dedicated case,
+  `test_dec_a_admitted_real_core_reaches_ready`, goes further: under explicit
+  authorization it launches a real, isolated CastleArq Core `0.5.1`
+  installation through the real coordinator, the real Qt transport, and the
+  production allowlist, and requires readiness to really reach `READY`. All
+  cases are skipped unless `CASTLEARQ_RUNTIME_IT=1` is set. That real-Core
+  case validates the launch → readiness → shutdown flow and the three
+  approved endpoints (`/health`, `/v1/models`, `/v1/artifacts`) against Core
+  `0.5.1` only; it does not cover other Core versions or the rest of Core's
+  API surface.
 
 
 ## Known limitations
 
-- **DEC-A is not approved** — production readiness admission is fail-closed
-  (`VersionAdmission.NOT_EVALUATED`), so a readiness success state cannot be
-  reached in production until an admission source and criteria are explicitly
-  approved.
+- **DEC-A admits exactly one version** — production readiness admission is
+  fail-closed (`VersionAdmission.NOT_EVALUATED` as the static input plus
+  conservative per-pass version comparison), so a readiness success state
+  requires a matched version that is explicitly allowlisted. Today that is
+  only `0.5.1` (real-verified against an isolated Core `0.5.1` install);
+  every other version — including newer Core releases — stays fail-closed
+  until separately verified against a real Core install and explicitly
+  added to the allowlist.
 - No chat, inference, model-library, or conversation-persistence experience is
   implemented yet; the corresponding modules remain boundary placeholders.
 - No bundled Linux installers (AppImage, `.deb`) are provided; installation is
@@ -205,9 +248,11 @@ Two suites exist, with different purposes:
   5 seconds); non-blocking validation is a separately tracked design concern.
 - Port-conflict detection at startup is not implemented (the error code and
   port constants exist in the contracts only).
-- Integration evidence is based on test doubles and purpose-built test
-  subprocesses; behavior with a real CastleArq Core installation has not been
-  established.
+- Integration evidence is limited to Core `0.5.1` — the opt-in runtime suite
+  launches a real, isolated Core `0.5.1` installation through the production
+  path (launch, readiness over `/health`, `/v1/models`, `/v1/artifacts`, and
+  coordinated shutdown), but no other Core version and no further API surface
+  has been exercised against a real installation.
 - The legacy synchronous HTTP readiness engine is retained for compatibility;
   production readiness uses the asynchronous Qt transport.
 

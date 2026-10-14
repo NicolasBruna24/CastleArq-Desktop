@@ -82,8 +82,11 @@ def main(argv: Optional[List[str]] = None) -> int:
 
     settings = create_interpreter_settings()
     clock = MonotonicClock()
-    # DEC-A remains fail-closed: no admission source is approved, so readiness
-    # cannot succeed until one is (see contracts/readiness.py).
+    # DEC-A (conservative admission): the static input stays NOT_EVALUATED
+    # (fail-closed); per-pass dynamics engage through the coordinator's
+    # installed-version provider, and production READY requires a matched
+    # version that is explicitly allowlisted — currently only 0.5.1 (see
+    # core/version_admission.py).
     coordinator = CoreStartupCoordinator(
         settings=settings,
         clock=clock,
