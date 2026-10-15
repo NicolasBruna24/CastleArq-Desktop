@@ -70,6 +70,9 @@ High-level layering, top to bottom (all packages under `src/castlearq_desktop/`)
 - `core/subprocess_adapter.py` — the concrete `subprocess.Popen` process
   adapter (no shell, null-device stdio, definite-vs-uncertain spawn-error
   classification).
+- `core/version_admission.py`, `core/version_probe.py` — the DEC-A version
+  policy and, separately, the worker that resolves the really-installed
+  version off the GUI thread and delivers it back through a queued Qt signal.
 - `core/readiness_qt_transport.py` — asynchronous readiness engine over
   `QNetworkAccessManager` and `QTimer` (per-request timeout, global deadline,
   polling, exactly-once terminal delivery).
@@ -246,6 +249,12 @@ Two suites exist, with different purposes:
   via `pip` as described above.
 - Interpreter validation is synchronous on the calling thread (bounded to
   5 seconds); non-blocking validation is a separately tracked design concern.
+- The installed-version probe used for DEC-A admission runs on a worker, so
+  readiness never blocks the GUI thread on it. A probe still in flight can
+  outlive the window: closing does not wait for the worker, but the pool and
+  interpreter lifecycle may delay the final teardown of the process. Stale
+  results are invalidated rather than applied, yet an in-flight probe is not
+  cancelled and immediate exit is not guaranteed.
 - Port-conflict detection at startup is not implemented (the error code and
   port constants exist in the contracts only).
 - Integration evidence is limited to Core `0.5.1` — the opt-in runtime suite

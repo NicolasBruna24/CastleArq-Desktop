@@ -33,6 +33,7 @@ from __future__ import annotations
 import sys
 from typing import List, Optional
 
+from PySide6.QtCore import QThreadPool
 from PySide6.QtWidgets import QApplication
 
 from castlearq_desktop import APP_NAME, ORGANIZATION_DOMAIN, ORGANIZATION_NAME
@@ -87,10 +88,16 @@ def main(argv: Optional[List[str]] = None) -> int:
     # installed-version provider, and production READY requires a matched
     # version that is explicitly allowlisted — currently only 0.5.1 (see
     # core/version_admission.py).
+    #
+    # The installed-version probe is a bounded blocking subprocess (5 s), so
+    # production runs it on a worker instead of on the GUI thread. The pool is
+    # injected here rather than defaulted inside the coordinator so the
+    # deterministic tests keep their synchronous behaviour.
     coordinator = CoreStartupCoordinator(
         settings=settings,
         clock=clock,
         api_contract=VersionAdmission.NOT_EVALUATED,
+        probe_pool=QThreadPool.globalInstance(),
     )
     controller = StartupController(coordinator)
 

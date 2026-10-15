@@ -125,6 +125,7 @@ class QtReadinessTransport(QObject):
         timer_factory: Callable[[], Any],
         nam: Optional[Any] = None,
         installed_version_provider: Optional[Callable[[], Any]] = None,
+        version_pending: Optional[Callable[[], bool]] = None,
         supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS,
     ) -> None:
         super().__init__()
@@ -135,11 +136,15 @@ class QtReadinessTransport(QObject):
         self._timer_factory = timer_factory
         self._nam = nam if nam is not None else QNetworkAccessManager(self)
         self._installed_version_provider = installed_version_provider
+        self._version_pending = version_pending
         self._supported_versions = supported_versions
 
         self._finished = False
         self._deadline: Optional[Deadline] = None
         self._passes = 0
+
+        # True while a completed pass is waiting for the installed version.
+        self._held = False
 
         # per-pass state
         self._alive_before: Optional[bool] = None
@@ -163,7 +168,34 @@ class QtReadinessTransport(QObject):
 
     def stop(self) -> None:
         """Cancel the operation; finalize exactly once with a non-ready result."""
+        self._held = False
         self._finish(self._cancelled_result())
+
+    def resume(self) -> None:
+        """Resume a held pass once the installed version has been delivered.
+
+        Re-evaluates the responses retained from the held pass. It is a no-op
+        when nothing is held or the operation already finished, so a late
+        delivery can never turn a finished operation into ``READY``. The
+        global deadline is not reset: it was fixed once in :meth:`start`.
+        """
+        if self._finished or not self._held:
+            return
+        self._held = False
+        self._evaluate_pass()
+
+    def _hold_pass(self) -> None:
+        """Retain the pass responses and suspend the final evaluation.
+
+        All three HTTP replies have arrived but the installed version is still
+        pending. The responses stay in ``_pass_results``: no request is
+        re-issued, no timer is armed and nothing is emitted. Holding never
+        finalizes the operation — the global deadline timer keeps running, so
+        a version that never arrives still ends in the existing timeout.
+        """
+        if self._finished:
+            return
+        self._held = True
 
     # -- timer helper ---------------------------------------------------
     def _make_timer(self, seconds: float, slot: Callable[[], None]) -> Any:
@@ -293,6 +325,11 @@ class QtReadinessTransport(QObject):
         self._evaluate_pass()
 
     def _evaluate_pass(self) -> None:
+        if self._version_is_pending():
+            # Responses are complete but DEC-A cannot be evaluated yet. Hold
+            # the pass instead of emitting a premature not-ready outcome.
+            self._hold_pass()
+            return
         now = self._now()
         alive_after = self._observe()
         overrun = self._deadline.is_expired(now)
@@ -330,6 +367,20 @@ class QtReadinessTransport(QObject):
     # -- helpers --------------------------------------------------------
     def _now(self) -> float:
         return float(self._clock.monotonic())
+
+    def _version_is_pending(self) -> bool:
+        """Whether the installed version is still being resolved.
+
+        Only consulted when a probe seam was injected. A failing probe is
+        treated as "not pending" so the pass is evaluated and DEC-A fails
+        closed on the absent version rather than being held indefinitely.
+        """
+        if self._version_pending is None:
+            return False
+        try:
+            return bool(self._version_pending())
+        except Exception:
+            return False
 
     def _observe(self) -> Optional[bool]:
         try:

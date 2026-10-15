@@ -221,6 +221,13 @@ class StartupController(QObject):
         if checker is not None:
             checker.stop()
 
+        # Retire the installed-version probe generation so a result delivered
+        # after shutdown started is discarded instead of being applied. This is
+        # logical invalidation only: it never waits for the probe to finish and
+        # adds no signal to the Core process, so the approved shutdown budget
+        # and its outcome are unchanged.
+        self._coordinator.invalidate_version_probe()
+
         manager = self._coordinator.manager
         if manager is None:
             # No Core was ever started: nothing to shut down.

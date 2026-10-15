@@ -28,6 +28,7 @@ False; START_FAILED without owned handle → False; anything else → None
 
 from __future__ import annotations
 
+import weakref
 from dataclasses import dataclass, field
 from typing import Any, Callable, FrozenSet, Optional
 
@@ -76,6 +77,12 @@ class CoreStartupCoordinator:
     supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS
     manager: Optional[LifecycleManager] = None
     qt_nam: Optional[Any] = None
+    #: Optional worker pool used to run the installed-version probe off the
+    #: GUI thread. ``None`` preserves the original bounded synchronous query,
+    #: which is what the deterministic tests and the opt-in runtime suite
+    #: exercise. Production injects a pool (see ``app.py``) so readiness never
+    #: blocks the GUI thread on the 5 s subprocess.
+    probe_pool: Optional[Any] = None
     observer: Optional[LifecycleObserver] = field(default=None, init=False)
     spawn_calls: int = field(default=0, init=False)
     _last_readiness_result: Optional[Any] = field(default=None, init=False)
@@ -86,6 +93,19 @@ class CoreStartupCoordinator:
     # accepted launch resets it so no value leaks across attempts.
     _cached_installed_version: Optional[str] = field(default=None, init=False)
     _version_cache_valid: bool = field(default=False, init=False)
+    # M1 (async): identity of the startup attempt that owns the version
+    # cache. Every accepted launch advances it, so a probe result delivered
+    # for a superseded attempt can be recognised and dropped.
+    _version_generation: int = field(default=0, init=False)
+    # Whether the asynchronous probe has already been launched for the
+    # current generation: exactly one probe per startup attempt.
+    _version_probe_launched: bool = field(default=False, init=False)
+    # Single Qt bridge for this coordinator's lifetime (see
+    # ``core/version_probe.py``). Kept alive so a queued delivery always has
+    # a live receiver.
+    _probe_bridge: Optional[Any] = field(default=None, init=False)
+    # Readiness transport of the active attempt, used to resume a held pass.
+    _active_transport: Optional[Any] = field(default=None, init=False)
 
     def _ensure_manager(self) -> LifecycleManager:
         if self.manager is None:
@@ -130,9 +150,13 @@ class CoreStartupCoordinator:
                                    context=dict(error.technical_context))
         # M1: a new attempt starts here (validation passed, a launch outcome
         # — accepted, refused, or failed — is about to be produced). Reset
-        # the version cache so the previous attempt's value never leaks.
+        # the version cache so the previous attempt's value never leaks, and
+        # advance the generation so a probe still in flight for the previous
+        # attempt is recognised as stale when it is delivered.
         self._version_cache_valid = False
         self._cached_installed_version = None
+        self._version_generation += 1
+        self._version_probe_launched = False
         manager = self._ensure_manager()
         result = manager.start(python)
 
@@ -145,19 +169,26 @@ class CoreStartupCoordinator:
         return result
 
     def _installed_version(self) -> Optional[str]:
-        """Return installed castlearq version for the current attempt.
+        """Return the installed castlearq version for the current attempt.
 
-        Resolved at most once per startup attempt and reused across all
-        readiness passes of that attempt (M1). The first call resolves via
-        the injected provider (tests) or via the validated configured
-        interpreter; later calls reuse the cached outcome — including
-        ``None`` (resolution failure stays fail-closed, never retried
-        into a valid version within the same attempt).
+        Three resolutions are possible, in order:
+
+        1. an explicitly injected ``installed_version_provider`` resolves
+           synchronously, exactly as before (tests and explicit injection);
+        2. the production path launches the asynchronous probe once per
+           attempt and reports the version as *pending* until the probe is
+           delivered on the Qt thread;
+        3. with no worker pool injected, the original bounded synchronous
+           query is preserved unchanged.
+
+        A probe that completed but failed resolves to ``None`` **and** marks
+        the cache valid, so a resolution failure stays fail-closed and is
+        never retried into a valid version within the same attempt.
         """
         if self._version_cache_valid:
             return self._cached_installed_version
-        self._version_cache_valid = True
         if self.installed_version_provider is not None:
+            self._version_cache_valid = True
             try:
                 value = self.installed_version_provider()
             except Exception:
@@ -165,6 +196,17 @@ class CoreStartupCoordinator:
             self._cached_installed_version = (
                 value if isinstance(value, str) else None)
             return self._cached_installed_version
+        if self.probe_pool is not None:
+            # Asynchronous production path: launch at most one probe for this
+            # attempt and report the version as pending until it is delivered.
+            self._ensure_version_probe()
+            return self._cached_installed_version
+        # No worker pool injected: preserve the original synchronous query.
+        self._version_cache_valid = True
+        return self._resolve_installed_version_synchronously()
+
+    def _resolve_installed_version_synchronously(self) -> Optional[str]:
+        """Resolve the installed version with the bounded synchronous query."""
         try:
             python = self.settings.load()
         except Exception:
@@ -176,6 +218,105 @@ class CoreStartupCoordinator:
         self._cached_installed_version = query_installed_core_version(
             python, execute=self.version_executor)
         return self._cached_installed_version
+
+    def _ensure_version_probe(self) -> None:
+        """Launch the asynchronous installed-version probe once per attempt.
+
+        Never blocks: it only reads the configured interpreter and queues a
+        worker. When no interpreter is configured the resolution is recorded
+        immediately as absent, so readiness is fail-closed instead of being
+        held forever with nothing in flight.
+        """
+        if self._version_probe_launched:
+            return
+        self._version_probe_launched = True
+        if self.probe_pool is None:
+            return
+        try:
+            python = self.settings.load()
+        except Exception:
+            python = None
+        if not python:
+            self._cached_installed_version = None
+            self._version_cache_valid = True
+            return
+        self._launch_version_probe(python)
+
+    def _launch_version_probe(self, python: str) -> None:
+        """Queue one probe worker for the configured interpreter."""
+        from castlearq_desktop.core.version_probe import (
+            VersionProbeBridge,
+            VersionProbeRunnable,
+        )
+
+        bridge = self._ensure_probe_bridge()
+        runnable = VersionProbeRunnable(
+            weakref.ref(bridge),
+            self._version_generation,
+            python,
+            executor=self.version_executor,
+        )
+        self.probe_pool.start(runnable)
+
+    def _ensure_probe_bridge(self) -> Any:
+        """Return this coordinator's single Qt bridge, creating it lazily.
+
+        One bridge for the coordinator's lifetime: it is created on the
+        thread that runs readiness (the GUI thread in production), so every
+        delivery is queued back to that thread.
+        """
+        if self._probe_bridge is None:
+            from castlearq_desktop.core.version_probe import VersionProbeBridge
+
+            self._probe_bridge = VersionProbeBridge(self._on_version_delivered)
+        return self._probe_bridge
+
+    def _version_pending(self) -> bool:
+        """Whether the production version probe is still in flight.
+
+        Consulted by the readiness transport to decide whether a pass may be
+        evaluated yet. Injected providers and the synchronous fallback always
+        resolve immediately, so they are never pending.
+        """
+        if self.installed_version_provider is not None:
+            return False
+        if self.probe_pool is None:
+            return False
+        if self._version_cache_valid:
+            return False
+        self._ensure_version_probe()
+        return not self._version_cache_valid
+
+    def _on_version_delivered(self, payload: Any) -> None:
+        """Receive a delivered probe result on the Qt (GUI) thread.
+
+        Only this method writes the version cache. A result whose generation
+        no longer matches the active attempt is discarded, so a superseded
+        attempt can never overwrite the current one.
+        """
+        generation, version = payload
+        if generation != self._version_generation:
+            return  # stale: a newer attempt owns the cache now
+        self._cached_installed_version = (
+            version if isinstance(version, str) else None)
+        self._version_cache_valid = True
+        transport = self._active_transport
+        if transport is not None:
+            try:
+                transport.resume()
+            except Exception:  # noqa: BLE001 - a finished transport is inert
+                pass
+
+    def invalidate_version_probe(self) -> None:
+        """Retire the active probe generation (logical invalidation only).
+
+        Does not cancel the underlying subprocess: an in-flight probe keeps
+        running to completion, but its result is discarded because the
+        generation no longer matches. Never blocks the caller.
+        """
+        self._version_generation += 1
+        self._version_probe_launched = True
+        self._active_transport = None
 
     def check_readiness_once(
         self,
@@ -256,8 +397,12 @@ class CoreStartupCoordinator:
             timer_factory=timer_factory,
             nam=self.qt_nam,
             installed_version_provider=self._installed_version,
+            version_pending=self._version_pending,
             supported_versions=self.supported_versions,
         )
+        # Retained so a delivered version can resume a held pass. Replaced by
+        # the next attempt; a finished transport makes resume() inert.
+        self._active_transport = transport
         checker = QtReadinessChecker(transport)
         checker.result.connect(self._on_readiness_result)
         checker.error.connect(self._on_readiness_error)
@@ -266,9 +411,11 @@ class CoreStartupCoordinator:
 
     def _on_readiness_result(self, result: ReadinessWaitResult) -> None:
         self._last_readiness_result = result
+        self._active_transport = None
 
     def _on_readiness_error(self, exc: Exception) -> None:
         self._last_readiness_error = exc
+        self._active_transport = None
 
 
 class _CountingAdapter(SubprocessProcessAdapter):
