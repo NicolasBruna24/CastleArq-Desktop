@@ -40,7 +40,8 @@ class CatalogBridge(QObject):
         if callback is None:
             return
         try:
-            callback(payload)
+            generation, result = payload
+            callback(generation, result)
         except Exception:  # noqa: BLE001
             pass
 

@@ -10,7 +10,7 @@ from typing import Optional
 
 import pytest
 
-from PySide6.QtCore import QThreadPool
+from PySide6.QtCore import QThread, QThreadPool
 
 from castlearq_desktop.core.catalog_client import CatalogResult
 from castlearq_desktop.core.catalog_controller import CatalogController
@@ -180,6 +180,46 @@ def test_result_preserved_on_error(qapp):
     assert len(received) == 1
     assert received[0].models is not None
     assert len(received[0].models) == 1
+
+
+def test_real_qt_transport_delivers_result(qapp, qtbot):
+    """Integración real: check() -> QThreadPool -> CatalogRunnable ->
+    fetch_catalog() -> CatalogBridge.resolved -> _dispatch() ->
+    CatalogController._on_result().
+
+    Verifica que el trabajo se ejecuta en un hilo de trabajo y que el
+    resultado se entrega al hilo de la interfaz mediante el transporte Qt,
+    sin llamar directamente a _on_result().
+    """
+    received = []
+    failed = []
+    worker_threads = []
+    gui_thread = QThread.currentThread()
+
+    def fake_fetch(*, deadline=None):
+        worker_threads.append(QThread.currentThread())
+        return _make_result_json([])
+
+    ctl = CatalogController(is_ready=lambda: True, fetch=fake_fetch)
+    ctl.check_finished.connect(lambda r: received.append(r))
+    ctl.check_failed.connect(lambda msg: failed.append(msg))
+
+    assert ctl.check() is True
+    assert ctl.is_checking
+
+    qtbot.waitUntil(lambda: ctl._active_generation is None, timeout=5000)
+
+    assert not ctl.is_checking
+    assert len(received) == 1, f"expected exactly one result, got {received!r}"
+    assert len(failed) == 0, f"unexpected failure signal: {failed!r}"
+    assert received[0].models == ()
+    assert worker_threads, "the worker never executed"
+    assert worker_threads[0] is not gui_thread, (
+        "the work did not run on a thread distinct from the GUI thread"
+    )
+    assert gui_thread is QThread.currentThread(), (
+        "the callback was not processed on the GUI thread"
+    )
 
 
 __all__ = []
