@@ -160,6 +160,29 @@ class MainWindow(QMainWindow):
             )
         settings_layout.addWidget(self._updates_section)
         layout.addWidget(settings_box)
+
+        # Model Explorer: consults GET /v1/models when Core is READY.
+        try:
+            from castlearq_desktop.core.catalog_controller import (
+                CatalogController,
+            )
+            from castlearq_desktop.ui.model_explorer_view import (
+                ModelExplorerView,
+            )
+        except ImportError:  # Model Explorer is optional
+            self._catalog_controller = None
+            self._model_explorer = QLabel("Model Explorer unavailable.")
+            layout.addWidget(self._model_explorer)
+        else:
+            self._catalog_controller = CatalogController(
+                is_ready=self._core_is_ready,
+                parent=self,
+            )
+            self._model_explorer = ModelExplorerView(
+                controller=self._catalog_controller, parent=self
+            )
+            layout.addWidget(self._model_explorer)
+
         layout.addStretch(1)
 
         self.setCentralWidget(central)
@@ -235,7 +258,14 @@ class MainWindow(QMainWindow):
     def _on_state_changed(self, state: object) -> None:
         self._status_label.setText(f"Core: {getattr(state, 'value', state)}")
 
+    def _core_is_ready(self) -> bool:
+        """Return True when the last readiness result was positive."""
+        return bool(getattr(self, "_last_readiness_ready", False))
+
     def _on_readiness_result(self, result: object) -> None:
+        self._last_readiness_ready = bool(getattr(result, "ready", False))
+        if self._catalog_controller is not None:
+            self._model_explorer.set_core_ready(self._last_readiness_ready)
         if getattr(result, "ready", False):
             self._status_label.setText("Core: ready.")
         else:
@@ -259,6 +289,12 @@ class MainWindow(QMainWindow):
         if updater is not None:
             try:
                 updater.invalidate()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        catalog_ctl = getattr(self, "_catalog_controller", None)
+        if catalog_ctl is not None:
+            try:
+                catalog_ctl.invalidate()
             except Exception:  # noqa: BLE001 - close must not fail
                 pass
         if controller is not None and not controller.shutdown_complete:
