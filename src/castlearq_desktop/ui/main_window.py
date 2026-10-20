@@ -16,14 +16,10 @@
 
 """Main application window for CastleArq Desktop.
 
-Phase 1 presents a minimal, functional window with a clear placeholder stating
-that Core integration is not yet implemented. It intentionally contains no fake
-model data, no simulated inference, and no misleading indication that Core is
-connected.
-
-WP1 adds only the explicit interpreter-selection seam: a button that opens a
-file dialog, persists the chosen absolute path under the approved settings key,
-and does nothing when cancelled. It never launches CastleArq Core.
+Presents interpreter configuration, the CastleArq Core lifecycle status,
+the model catalog explorer, the local artifact library, and the chat view.
+It intentionally contains no fake model data and no simulated inference:
+everything shown comes from the configured interpreter and Core.
 """
 
 from __future__ import annotations
@@ -46,25 +42,28 @@ from castlearq_desktop.core.interpreter_settings import (
     InterpreterSettingsStore,
     create_interpreter_settings,
 )
+from castlearq_desktop.core.model_catalog import ModelEntry
+from castlearq_desktop.core.download_service import (
+    LocalLibraryService,
+    ModelAcquisitionService,
+)
 
 from typing import TYPE_CHECKING
 
 if TYPE_CHECKING:  # runtime stays decoupled from the controller implementation
     from castlearq_desktop.core.startup_controller import StartupController
 
-# Message shown to the user while Core integration is not implemented.
-_PLACEHOLDER_TEXT = (
-    "Core integration is not yet implemented.\n\n"
-    "This is the Phase 1 application skeleton. Future phases will add the "
-    "model library and chat screens once communication with CastleArq Core "
-    "is available."
-)
-
 # Shown while no interpreter path has been explicitly selected.
 _NO_SELECTION_TEXT = "No Python interpreter selected yet."
 
 # Shown in the Core status line before any startup is requested.
 _STATUS_IDLE_TEXT = "Core: not started."
+
+# Shown in the model selection line while no model is selected.
+_NO_MODEL_TEXT = "Ningún modelo seleccionado."
+
+# Shown in the artifact selection line while no installed artifact is selected.
+_NO_ARTIFACT_TEXT = "Ningún artefacto local seleccionado."
 
 
 class MainWindow(QMainWindow):
@@ -92,6 +91,11 @@ class MainWindow(QMainWindow):
         # any process or HTTP concern directly.
         self._controller = controller
 
+        # Selected catalog model and selected installed artifact are kept
+        # apart: they come from two different surfaces of Core.
+        self._selected_model = None
+        self._selected_artifact = None
+
         central = QWidget(self)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(24, 24, 24, 24)
@@ -102,13 +106,6 @@ class MainWindow(QMainWindow):
         title_font.setPointSize(title_font.pointSize() + 6)
         title_font.setBold(True)
         title.setFont(title_font)
-
-        placeholder = QLabel(_PLACEHOLDER_TEXT)
-        placeholder.setWordWrap(True)
-        placeholder.setAlignment(Qt.AlignmentFlag.AlignTop)
-        placeholder.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
 
         self._interpreter_button = QPushButton("Select Python interpreter…")
         self._interpreter_button.clicked.connect(self._on_select_interpreter)
@@ -121,7 +118,6 @@ class MainWindow(QMainWindow):
         )
 
         layout.addWidget(title)
-        layout.addWidget(placeholder)
         layout.addWidget(self._interpreter_button)
         layout.addWidget(self._interpreter_label)
 
@@ -129,10 +125,27 @@ class MainWindow(QMainWindow):
         self._status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+        # Selection feedback lives in its own labels: the Core status line
+        # reports Core's own state and must not be overwritten by a UI
+        # selection. The catalog selection and the installed-artifact
+        # selection are kept apart, because they come from two different
+        # surfaces of Core and neither replaces the other.
+        self._model_status_label = QLabel(_NO_MODEL_TEXT)
+        self._model_status_label.setWordWrap(True)
+        self._model_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        self._artifact_status_label = QLabel(_NO_ARTIFACT_TEXT)
+        self._artifact_status_label.setWordWrap(True)
+        self._artifact_status_label.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
         self._start_button = QPushButton("Start Core")
         self._start_button.clicked.connect(self._on_start)
         layout.addWidget(self._start_button)
         layout.addWidget(self._status_label)
+        layout.addWidget(self._model_status_label)
+        layout.addWidget(self._artifact_status_label)
 
         # Settings → Updates (Stage 3): minimal section, no navigation change.
         settings_box = QGroupBox("Settings", self)
@@ -181,7 +194,67 @@ class MainWindow(QMainWindow):
             self._model_explorer = ModelExplorerView(
                 controller=self._catalog_controller, parent=self
             )
+            self._model_explorer.set_downloader(
+                ModelAcquisitionService(
+                    interpreter_settings=self._interpreter_settings
+                )
+            )
             layout.addWidget(self._model_explorer)
+            self._model_explorer.model_selected.connect(self._on_model_selected)
+            self._model_explorer.model_unselected.connect(self._on_model_unselected)
+            self._model_explorer.acquisition_finished.connect(
+                self._on_acquisition_finished
+            )
+
+        # Local library: the artifacts Core really finds in the model store.
+        # Its state is independent from Core's status line, from the catalog
+        # and from the acquisition.
+        try:
+            from castlearq_desktop.ui.local_library_view import LocalLibraryView
+        except ImportError:  # Local library is optional
+            self._local_library = QLabel("Local library unavailable.")
+            layout.addWidget(self._local_library)
+        else:
+            self._local_library_service = LocalLibraryService(
+                interpreter_settings=self._interpreter_settings
+            )
+            self._local_library = LocalLibraryView(
+                service=self._local_library_service, parent=self
+            )
+            layout.addWidget(self._local_library)
+            self._local_library.artifact_selected.connect(
+                self._on_artifact_selected
+            )
+            self._local_library.artifact_unselected.connect(
+                self._on_artifact_unselected
+            )
+            # A *correct* library query feeds the explorer's local
+            # availability section with the complete artifact list. No
+            # query is ever started for this, and before the first query
+            # there is nothing to send: the explorer claims nothing.
+            self._local_library_service.finished.connect(
+                self._on_local_library_finished
+            )
+
+        # Chat: a real session on Core's HTTP API. The session owns the
+        # conversation; Desktop only shows what Core answered.
+        try:
+            from castlearq_desktop.core.chat_service import ChatService
+            from castlearq_desktop.ui.chat_view import ChatView
+        except ImportError:  # Chat is optional
+            self._chat_view = QLabel("Chat unavailable.")
+            layout.addWidget(self._chat_view)
+        else:
+            self._chat_service = ChatService(parent=self)
+            self._chat_view = ChatView(service=self._chat_service, parent=self)
+            layout.addWidget(self._chat_view)
+            self._chat_view.session_closed.connect(self._on_chat_session_closed)
+            # The library re-checks this state right before applying a
+            # pending selection: a session can open while the query runs.
+            if hasattr(self._local_library, "set_session_active_provider"):
+                self._local_library.set_session_active_provider(
+                    lambda: bool(getattr(self._chat_view, "has_session", False))
+                )
 
         layout.addStretch(1)
 
@@ -206,6 +279,111 @@ class MainWindow(QMainWindow):
             return  # non-absolute selections are rejected before persistence
         self._interpreter_settings.save(path)
         self._interpreter_label.setText(path)
+
+    # -- Model selection (new Phase 2) -------------------------------------
+    def _on_model_selected(self, entry: ModelEntry) -> None:
+        """Forward the user-selected model to MainWindow for display.
+
+        Browsing the catalog never touches the chat conversation: the
+        session belongs to the installed artifact, and only changing
+        that artifact (via ``ChatView.set_artifact``) closes it.
+        """
+        self._selected_model = entry
+        self._model_status_label.setText(
+            f"Modelo seleccionado: {entry.name} ({entry.model_id})"
+        )
+
+    def _on_model_unselected(self) -> None:
+        """Clear the current selection in MainWindow.
+
+        Deselecting a catalog model also leaves any open chat session
+        untouched, for the same reason as ``_on_model_selected``.
+        """
+        self._selected_model = None
+        self._model_status_label.setText(_NO_MODEL_TEXT)
+
+    # -- Local library (installed artifacts) --------------------------------
+    def _on_artifact_selected(self, artifact) -> None:
+        """Report the selected installed artifact in its own line.
+
+        The catalog selection keeps its own line: selecting an installed
+        artifact never erases the catalog selection, and vice versa.
+        """
+        self._selected_artifact = artifact
+        self._artifact_status_label.setText(
+            f"Artefacto instalado: {artifact.filename} ({artifact.model_id})"
+        )
+        chat_view = getattr(self, "_chat_view", None)
+        if chat_view is not None and hasattr(chat_view, "set_artifact"):
+            chat_view.set_artifact(artifact)
+
+    def _on_artifact_unselected(self) -> None:
+        """Clear the selected installed artifact."""
+        self._selected_artifact = None
+        self._artifact_status_label.setText(_NO_ARTIFACT_TEXT)
+        chat_view = getattr(self, "_chat_view", None)
+        if chat_view is not None and hasattr(chat_view, "set_artifact"):
+            chat_view.set_artifact(None)
+
+    def _on_chat_session_closed(self) -> None:
+        """React to a chat session that was closed on Core."""
+        return
+
+    def _on_acquisition_finished(self, result) -> None:
+        """Refresh the local library after an acquisition ended.
+
+        The refresh is asynchronous and never blocks the GUI thread; it is
+        skipped when another query is already running, so no duplicate
+        query is ever started. The library reports Core's own store state,
+        so a successful transfer is never presented as verified here.
+
+        When the acquisition really succeeded, fully identifies its
+        artifact and would not interrupt an active conversation, that
+        artifact is scheduled as the library's pending selection: it is
+        applied only if Core's own results actually contain it (and never
+        before the chat session question is settled). A failed or
+        incomplete result clears any pending request instead. If no new
+        query can start, the pending request is kept for the query already
+        in course — the refresh is not assumed to have happened.
+        """
+        library = getattr(self, "_local_library", None)
+        if library is None:
+            return
+        service = getattr(self, "_local_library_service", None)
+        if service is None:
+            return
+        chat_view = getattr(self, "_chat_view", None)
+        session_active = bool(getattr(chat_view, "has_session", False))
+        succeeded = bool(getattr(result, "succeeded", False))
+        model_id = getattr(result, "model_id", None)
+        filename = getattr(result, "filename", None)
+        if succeeded and model_id and filename and not session_active:
+            # AcquisitionResult exposes no quantization; the identity Core
+            # reported (model_id + filename) is passed without guessing.
+            library.set_pending_selection(model_id, filename)
+        else:
+            library.clear_pending_selection()
+        if service.is_busy:
+            # No new query is started here; the query already in course
+            # will deliver the results that consume the pending selection.
+            return
+        if not service.refresh():
+            # The refresh did not start (shutting down): the pending
+            # request stays for the query in course; invalidate() clears it.
+            return
+
+    def _on_local_library_finished(self, artifacts, store=None) -> None:
+        """Show Core's complete artifact list in the explorer's detail.
+
+        ``LocalLibraryService.finished`` only fires for a correct query (a
+        failed one travels through ``failed``), so the explorer never
+        presents an invented answer, and this handler starts no query of
+        its own. The library view consumes the same signal as before; this
+        is an additional consumer.
+        """
+        explorer = getattr(self, "_model_explorer", None)
+        if explorer is not None and hasattr(explorer, "set_local_artifacts"):
+            explorer.set_local_artifacts(artifacts)
 
     # -- Core startup / readiness / shutdown (delegated to the controller) --
     def _connect_controller(self) -> None:
@@ -295,6 +473,37 @@ class MainWindow(QMainWindow):
         if catalog_ctl is not None:
             try:
                 catalog_ctl.invalidate()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        explorer = getattr(self, "_model_explorer", None)
+        if explorer is not None and hasattr(explorer, "invalidate"):
+            try:
+                explorer.invalidate()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        library = getattr(self, "_local_library", None)
+        if library is not None and hasattr(library, "invalidate"):
+            try:
+                library.invalidate()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        library_service = getattr(self, "_local_library_service", None)
+        if library_service is not None:
+            try:
+                library_service.close()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        chat_service = getattr(self, "_chat_service", None)
+        if chat_service is not None:
+            try:
+                # Deletes the session on Core so no runtime outlives the window.
+                chat_service.close()
+            except Exception:  # noqa: BLE001 - close must not fail
+                pass
+        chat_view = getattr(self, "_chat_view", None)
+        if chat_view is not None and hasattr(chat_view, "invalidate"):
+            try:
+                chat_view.invalidate()
             except Exception:  # noqa: BLE001 - close must not fail
                 pass
         if controller is not None and not controller.shutdown_complete:

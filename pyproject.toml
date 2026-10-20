@@ -7,7 +7,7 @@ name = "castlearq-desktop"
 version = "0.1.0"
 description = "Linux-first PySide6 desktop application for managing the CastleArq Core process lifecycle (experimental developer preview)."
 readme = "README.md"
-requires-python = ">=3.10"
+requires-python = ">=3.11"
 license = { text = "Apache-2.0" }
 dependencies = [
     "PySide6>=6.5",

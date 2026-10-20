@@ -404,3 +404,23 @@ def test_extract_health_version_shapes():
     assert evaluate_version_admission(
         ADMITTED, health_body(ADMITTED),
         supported_versions=ALLOW) is VersionAdmission.ADMITTED
+
+
+def test_not_evaluated_without_provider_blocks_readiness():
+    """NOT_EVALUATED with no installed_version_provider stays fail-closed.
+
+    When no provider is configured, _resolve_contract() returns the static
+    api_contract (NOT_EVALUATED), which evaluate_readiness() rejects via
+    the API_CONTRACT condition. This is the production fallback when the
+    async probe path is not available.
+    """
+    c = ReadinessHttpClient(
+        transport=script_transport(health_body(ADMITTED)),
+        child_observer=lambda: True,
+        api_contract=VersionAdmission.NOT_EVALUATED,
+    )
+    out = c.probe_once(now=0.0)
+    assert out.ready is False
+    assert out.error_code is ErrorCode.API_CONTRACT_INCOMPATIBLE
+    conds = [f.condition.value for f in out.outcome.failures]
+    assert "api_contract" in conds

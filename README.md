@@ -1,14 +1,10 @@
-# CastleArq Desktop
+# CastleArq Desktop — Experimental Preview 0.1.0
 
-CastleArq Desktop is a Linux-first PySide6 desktop application for configuring
-and managing the lifecycle of a CastleArq Core process: it lets the user select
-an explicit Python interpreter, validates it, launches Core as a Desktop-owned
-process, observes its lifecycle, performs asynchronous HTTP readiness checks,
-and coordinates a bounded shutdown when the application closes.
-
-It is **not yet** a complete chat application or model-management interface:
-chat/inference, model discovery or acquisition, and conversation persistence
-are future work (see [Known limitations](#known-limitations)).
+CastleArq Desktop is a Linux-first PySide6 desktop application for working
+with CastleArq Core models locally: it lets the user select an explicit
+Python interpreter, launch Core as a Desktop-owned process, explore the
+model catalog, acquire models through Core, manage the local artifact
+library, and hold real chat sessions against a running Core.
 
 ## Current capabilities
 
@@ -41,6 +37,23 @@ Implemented and covered by automated tests:
 - **Status feedback** — the main window shows lifecycle states and readiness
   outcomes through a status line; startup and shutdown are requested through
   the application controller, never by the UI directly.
+- **Model catalog explorer** — browse the models Core reports, read their
+  metadata (provider, family, task, architecture, runtimes, supported
+  quantizations), pick an announced quantization variant, and see the local
+  availability already reported by Core for each model.
+- **Model acquisition** — request a download of the selected model/variant
+  through CastleArq Core; the result (destination, store state, verification
+  status) is shown in the explorer, and the local library refreshes
+  afterwards.
+- **Local artifact library** — list the artifacts Core reports as installed
+  (file, model, observed quantization, store state, problem details when
+  Core reports them), select the exact artifact to use, and keep that
+  selection stable across library refreshes.
+- **Real chat sessions** — open a session against the running Core bound to
+  the selected artifact, send consecutive turns whose history Core keeps,
+  and close the session explicitly, by changing artifact, or by closing the
+  window (which deletes the Core session). Transport, HTTP and Core errors
+  are reported with actionable messages.
 
 ## Architecture
 
@@ -52,9 +65,10 @@ High-level layering, top to bottom (all packages under `src/castlearq_desktop/`)
   `StartupController` for the whole run, and maps a terminal `SHUTDOWN_FAILED`
   outcome to a non-zero process exit code.
 - `ui/main_window.py` — presentation only. Interpreter selection, a *Start
-  Core* action, a lifecycle/readiness status line, and close handling that
-  defers to the controller while shutdown is pending. The UI never owns
-  processes, HTTP requests, or persistence.
+  Core* action, lifecycle/readiness status, the model catalog explorer, the
+  local artifact library, and the chat view. Close handling defers to the
+  controller while shutdown is pending and deletes any open chat session in
+  Core first. The UI never owns processes, HTTP requests, or persistence.
 - `core/startup_controller.py` — application controller (`QObject` with Qt
   signals). Orchestrates a single startup attempt, retains the asynchronous
   readiness checker for the whole operation, suppresses stale results, and
@@ -177,15 +191,18 @@ policy logic.
 
 ## Setup
 
-Requirements: Python 3.10 or newer for Desktop itself (the *Core interpreter*
-you select must be 3.11 or newer), and PySide6 6.5 or newer. Development is
-Linux-first; other platforms are not validated.
+Requirements: Linux; Python 3.11 or newer; PySide6 6.5 or newer; and
+CastleArq Core **exactly `0.5.1`, installed separately in the interpreter you
+select** (Desktop never installs or upgrades Core for you — see the Core
+project's own installation instructions for `castlearq==0.5.1`). Other
+platforms are not validated and no native installers (AppImage, `.deb`) are
+provided in this preview.
 
-Install the package in editable mode together with the test extra (this
-installs PySide6 and pytest):
+Install the package (this installs PySide6 and the `castlearq-desktop` entry
+point, `castlearq_desktop.app:main`):
 
 ```bash
-python -m pip install -e ".[test]"
+python -m pip install .
 ```
 
 Run the application:
@@ -199,6 +216,24 @@ castlearq-desktop
 To actually start Core, select an absolute interpreter path in the window that
 has the `castlearq` package installed, then press *Start Core*.
 
+## First run
+
+1. Start the application with `castlearq-desktop` (or
+   `python -m castlearq_desktop`).
+2. Click **“Select Python interpreter…”** and choose the absolute path of the
+   Python interpreter that has CastleArq Core `0.5.1` installed. The choice
+   is persisted via `QSettings`; nothing is launched until you request it.
+3. Click **“Start Core”**. If the interpreter path is invalid, Core is not
+   installed there, its version is not exactly `0.5.1`, Core is unreachable,
+   or readiness fails, the status line reports the cause with an actionable
+   message (missing distribution, version mismatch, transport failure, or
+   timeout) instead of starting.
+4. Once Core is ready, the model catalog explorer fills in: pick a model and
+   quantization variant, acquire it through Core, select the resulting
+   artifact in the local library, and open a chat session against it.
+   Closing the window deletes any open chat session in Core first, then
+   shuts Core down within a bounded (5-second) coordinated shutdown.
+
 ## Testing
 
 Two suites exist, with different purposes:
@@ -210,7 +245,9 @@ Two suites exist, with different purposes:
   ```
 
   Deterministic; processes, clocks, timers, and HTTP are faked or simulated.
-  Tests that require Qt skip automatically when PySide6 is unavailable.
+  Tests that require Qt skip automatically when PySide6 is unavailable. The
+  test extra (`pip install -e ".[test]"`) is for development only; running
+  the application itself needs just the base install plus Core `0.5.1`.
 
 - **Runtime integration tests** (opt-in only):
 
@@ -243,8 +280,9 @@ Two suites exist, with different purposes:
   every other version — including newer Core releases — stays fail-closed
   until separately verified against a real Core install and explicitly
   added to the allowlist.
-- No chat, inference, model-library, or conversation-persistence experience is
-  implemented yet; the corresponding modules remain boundary placeholders.
+- No conversation persistence is implemented: chat history lives in the
+  running Core session and is deleted when the session closes; closing the
+  window deletes the session.
 - No bundled Linux installers (AppImage, `.deb`) are provided; installation is
   via `pip` as described above.
 - Interpreter validation is synchronous on the calling thread (bounded to
@@ -267,11 +305,23 @@ Two suites exist, with different purposes:
 
 ## Project status
 
-The Core-launch integration (configuration → validation → launch → observation
-→ readiness → coordinated shutdown) is implemented and covered by a
-deterministic unit/contract suite plus the opt-in runtime integration suite.
-The project is suitable for a limited developer preview with the limitations
-above. Chat, model management, persistence, and packaging remain future work.
+Experimental Preview 0.1.0: configuration → validation → launch → observation
+→ readiness → coordinated shutdown, plus the model catalog explorer, model
+acquisition through Core, the local artifact library, and real chat sessions
+against Core, are implemented and covered by a deterministic unit/contract
+suite plus the opt-in runtime integration suite. The project is suitable for
+a limited experimental preview on Linux with the limitations above.
+Conversation persistence, native installers, and universal model/hardware
+support remain out of scope for this preview.
+
+## Reporting issues
+
+Please report problems at
+[https://github.com/NicolasBruna24/CastleArq-Desktop/issues](https://github.com/NicolasBruna24/CastleArq-Desktop/issues)
+(`origin` remote verified locally). Include the Desktop version (`0.1.0`),
+the exact Core version installed, the interpreter path selected, the
+status-line message shown, and — for chat or library problems — the model id,
+artifact filename, and observed quantization/state.
 
 ## License
 

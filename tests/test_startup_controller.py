@@ -579,3 +579,36 @@ def test_start_failure_without_error_or_code_is_graceful(qt_app):
         assert "start failed" in window._status_label.text()
     finally:
         window.close()
+
+
+def test_selecting_a_model_does_not_overwrite_the_core_status(qt_app):
+    """The model selection line is separate from the Core status line."""
+    from castlearq_desktop.core.model_catalog import ModelEntry
+
+    b = build(FakePopen())
+    window = MainWindow(interpreter_settings=b.coordinator.settings,
+                        controller=b.controller)
+    try:
+        window._status_label.setText("Core: ready.")
+        entry = ModelEntry(
+            model_id="qwen2.5-coder-7b-instruct",
+            name="Qwen2.5-Coder 7B Instruct",
+            provider="Qwen",
+            family="Qwen2.5-Coder",
+            task="coding",
+            architecture="Transformer",
+            parameter_count_b=7.0,
+            context_length=32768,
+            supported_runtimes=("llama.cpp / llama.app",),
+            supported_backends=("Vulkan", "CPU"),
+            quantizations=("Q4_K_M",),
+            downloadable=True,
+        )
+        window._on_model_selected(entry)
+        assert window._status_label.text() == "Core: ready."
+        assert "Qwen2.5-Coder 7B Instruct" in window._model_status_label.text()
+
+        window._on_model_unselected()
+        assert window._model_status_label.text() == "Ningún modelo seleccionado."
+    finally:
+        window.close()
