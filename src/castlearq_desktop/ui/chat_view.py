@@ -164,9 +164,16 @@ class ChatView(QWidget):
         prompt = self._prompt.toPlainText().strip()
         if not prompt:
             return
+        accepted = self._service.send_turn(prompt)
+        if not accepted:
+            # Rejected (busy, no session, empty): nothing was sent, so the
+            # conversation stays untouched and the input is preserved.
+            self._status.setText("El turno no fue aceptado.")
+            self._prompt.setPlainText(prompt)
+            self._update_controls()
+            return
         self._prompt.clear()
         self._append(f"Tú: {prompt}")
-        self._service.send_turn(prompt)
 
     def _on_close(self) -> None:
         """Close the session on Core and drop the visible history."""

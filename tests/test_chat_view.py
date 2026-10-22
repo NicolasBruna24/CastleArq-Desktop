@@ -52,6 +52,7 @@ class FakeService(QObject):
         super().__init__()
         self.is_busy = False
         self.refuse_open = False
+        self.refuse_send = False
         self.opened: list[tuple[str, str, Optional[str]]] = []
         self.turns: list[str] = []
         self.closed_sessions = 0
@@ -66,6 +67,8 @@ class FakeService(QObject):
         return True
 
     def send_turn(self, prompt: str) -> bool:
+        if self.refuse_send:
+            return False
         self.turns.append(prompt)
         return True
 
@@ -317,3 +320,21 @@ def test_invalidating_drops_the_pending_results(view) -> None:
     assert service.invalidations == 1
     assert widget._send_button.isEnabled() is False
     assert widget._history.toPlainText() == ""
+
+def test_a_rejected_send_keeps_history_and_feedback(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+    service.refuse_send = True
+    widget._prompt.setPlainText("adios")
+    history_before = widget._history.toPlainText()
+
+    widget._on_send()
+
+    assert "no fue aceptado" in widget._status.text()
+    assert widget._history.toPlainText() == history_before
+    assert "adios" not in widget._history.toPlainText()
+    assert widget._prompt.toPlainText() == "adios"
