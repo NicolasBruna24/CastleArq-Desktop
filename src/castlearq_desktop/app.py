@@ -96,8 +96,8 @@ def _readiness_log_path() -> str:
 
 
 def _configure_readiness_debug_logging() -> None:
-    """Configure file logging for the readiness loggers (opt-in).",
-    """
+    """Configure file logging for the readiness loggers (opt-in).
+
     Installs a rotating ``FileHandler`` on each readiness logger so that
     DEBUG messages are captured without touching the root logger nor enabling
     DEBUG globally. If the file cannot be created or configured, a clear
@@ -137,9 +137,9 @@ def _configure_readiness_debug_logging() -> None:
         # else: reuse the existing handler in all loggers.
     except Exception as exc:
         # Handler configuration failed (OSError or anything else): report it on
-        stderr but keep going, so that the DEBUG level of every readiness
-        logger is still restored. Logging diagnostics must never abort the
-        application startup.
+        # stderr but keep going, so that the DEBUG level of every readiness
+        # logger is still restored. Logging diagnostics must never abort the
+        # application startup.
         if created_handler is not None:
             try:
                 created_handler.close()

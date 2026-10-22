@@ -60,6 +60,9 @@ _NO_SELECTION_TEXT = "No Python interpreter selected yet."
 # Shown in the Core status line before any startup is requested.
 _STATUS_IDLE_TEXT = "Core: not started."
 
+#: Logger dedicado al diagnóstico temporal de readiness (solo DEBUG).
+_logger = logging.getLogger(__name__)
+
 # Shown in the model selection line while no model is selected.
 _NO_MODEL_TEXT = "Ningún modelo seleccionado."
 
@@ -69,8 +72,6 @@ _NO_ARTIFACT_TEXT = "Ningún artefacto local seleccionado."
 
 class MainWindow(QMainWindow):
     """The primary application window."""
-
-_logger = logging.getLogger(__name__)
 
     def __init__(
         self,
@@ -341,10 +342,6 @@ _logger = logging.getLogger(__name__)
 
     def _on_acquisition_failed(self, message: str) -> None:
         """React to a failed acquisition (both visible in the explorer and here)."""
-
-        Never schedules a library selection, never starts a download or any
-        other network operation, and preserves any previously valid artifact
-        selection in the library."""
         library = getattr(self, "_local_library", None)
         if library is not None:
             library.clear_pending_selection()
@@ -398,10 +395,6 @@ _logger = logging.getLogger(__name__)
 
     def _schedule_library_refresh(self, service) -> None:
         """Start a library refresh if possible; remember one pending request."""
-
-        If a query is already running, remember the request and consume it
-        once that query finishes (via "_on_local_library_finished")."""
-        Avoids duplicates and never loses a scheduled refresh."""
         if self._pending_library_refresh:
             return
 
