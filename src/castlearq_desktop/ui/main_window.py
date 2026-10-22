@@ -25,6 +25,7 @@ everything shown comes from the configured interpreter and Core.
 from __future__ import annotations
 
 import os
+import logging
 
 from PySide6.QtCore import Qt
 from PySide6.QtWidgets import (
@@ -68,6 +69,8 @@ _NO_ARTIFACT_TEXT = "Ningún artefacto local seleccionado."
 
 class MainWindow(QMainWindow):
     """The primary application window."""
+
+_logger = logging.getLogger(__name__)
 
     def __init__(
         self,
@@ -476,6 +479,13 @@ class MainWindow(QMainWindow):
         return bool(getattr(self, "_last_readiness_ready", False))
 
     def _on_readiness_result(self, result: object) -> None:
+
+        _logger.debug(
+            "READINESS RESULT ready=%s error_code=%s deadline_expired=%s",
+            getattr(result, "ready", None),
+            getattr(result, "error_code", None),
+            getattr(result, "deadline_expired", None),
+        )
         self._last_readiness_ready = bool(getattr(result, "ready", False))
         if self._catalog_controller is not None:
             self._model_explorer.set_core_ready(self._last_readiness_ready)
