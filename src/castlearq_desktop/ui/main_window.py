@@ -95,6 +95,10 @@ class MainWindow(QMainWindow):
         # apart: they come from two different surfaces of Core.
         self._selected_model = None
         self._selected_artifact = None
+        #: Library refresh scheduled by a finished acquisition but not yet
+        #: started because another library query was already running.
+        self._pending_library_refresh: bool = False
+
 
         central = QWidget(self)
         layout = QVBoxLayout(central)
@@ -204,6 +208,9 @@ class MainWindow(QMainWindow):
             self._model_explorer.model_unselected.connect(self._on_model_unselected)
             self._model_explorer.acquisition_finished.connect(
                 self._on_acquisition_finished
+            )
+            self._model_explorer.acquisition_failed.connect(
+                self._on_acquisition_failed
             )
 
         # Local library: the artifacts Core really finds in the model store.
@@ -329,6 +336,19 @@ class MainWindow(QMainWindow):
         """React to a chat session that was closed on Core."""
         return
 
+    def _on_acquisition_failed(self, message: str) -> None:
+        """React to a failed acquisition (both visible in the explorer and here)."""
+
+        Never schedules a library selection, never starts a download or any
+        other network operation, and preserves any previously valid artifact
+        selection in the library."""
+        library = getattr(self, "_local_library", None)
+        if library is not None:
+            library.clear_pending_selection()
+        service = getattr(self, "_local_library_service", None)
+        if service is not None:
+            service.invalidate()
+
     def _on_acquisition_finished(self, result) -> None:
         """Refresh the local library after an acquisition ended.
 
@@ -363,13 +383,23 @@ class MainWindow(QMainWindow):
             library.set_pending_selection(model_id, filename)
         else:
             library.clear_pending_selection()
+        self._schedule_library_refresh(service)
         if service.is_busy:
-            # No new query is started here; the query already in course
-            # will deliver the results that consume the pending selection.
+            self._pending_library_refresh = True
             return
-        if not service.refresh():
-            # The refresh did not start (shutting down): the pending
-            # request stays for the query in course; invalidate() clears it.
+        if service.refresh():
+            return
+        # The refresh did not start (shutting down): the pending
+        # request stays for the query in course; invalidate() clears it.
+        return
+
+    def _schedule_library_refresh(self, service) -> None:
+        """Start a library refresh if possible; remember one pending request."""
+
+        If a query is already running, remember the request and consume it
+        once that query finishes (via "_on_local_library_finished")."""
+        Avoids duplicates and never loses a scheduled refresh."""
+        if self._pending_library_refresh:
             return
 
     def _on_local_library_finished(self, artifacts, store=None) -> None:
@@ -384,6 +414,11 @@ class MainWindow(QMainWindow):
         explorer = getattr(self, "_model_explorer", None)
         if explorer is not None and hasattr(explorer, "set_local_artifacts"):
             explorer.set_local_artifacts(artifacts)
+        if self._pending_library_refresh:
+            self._pending_library_refresh = False
+            service = getattr(self, "_local_library_service", None)
+            if service is not None and not service.is_busy:
+                service.refresh()
 
     # -- Core startup / readiness / shutdown (delegated to the controller) --
     def _connect_controller(self) -> None:

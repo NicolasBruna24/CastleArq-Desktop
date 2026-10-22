@@ -286,21 +286,18 @@ def test_download_button_disabled_without_selection(qapp):
 def test_download_button_enabled_for_downloadable_model(qapp):
     view, _ = _view_with_downloader(qapp)
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     assert view._download_button.isEnabled() is True
 
 
 def test_download_button_disabled_for_non_downloadable_model(qapp):
     view, _ = _view_with_downloader(qapp, [_entry(downloadable=False)])
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     assert view._download_button.isEnabled() is False
 
 
 def test_clicking_download_sends_the_selected_model(qapp):
     view, downloader = _view_with_downloader(qapp)
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     view._on_download_clicked()
 
     assert len(downloader.requests) == 1
@@ -312,7 +309,6 @@ def test_download_not_requested_without_a_downloader(qapp):
     view = ModelExplorerView(controller=controller, parent=None)
     view._populate((_entry(),))
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     view._on_download_clicked()  # must not raise
     assert view._download_button.isEnabled() is False
 
@@ -333,11 +329,13 @@ def test_verified_result_is_reported_as_verified(qapp):
             store_state=StoreState.VERIFIED,
         )
     )
-    assert "verificada" in view._status.text()
-    assert "verificado por el Core" in view._detail.text()
+    assert "Descarga completada y artefacto verificado por el Core: m." in view._status.text()
+    assert "verificado por el Core: m." in view._detail.text()
+    assert "Modelo: m" in view._detail.text()
+    assert "Variante: m.gguf" in view._detail.text()
 
 
-def test_downloaded_is_not_presented_as_verified(qapp):
+def test_downloaded_result_is_not_presented_as_verified(qapp):
     from castlearq_desktop.core.download_service import (
         AcquisitionResult,
         AcquisitionStatus,
@@ -353,8 +351,10 @@ def test_downloaded_is_not_presented_as_verified(qapp):
             store_state=StoreState.DOWNLOADED,
         )
     )
-    assert "verificada" not in view._status.text()
-    assert "descargado (según el Core)" in view._detail.text()
+    assert "verificada" not in view._status.text().replace("no verificada", "")
+    assert "registrada como descargada por el Core" in view._status.text()
+    assert "registrada como descargada por el Core" in view._detail.text()
+    assert "Variante: m.gguf" in view._detail.text()
 
 
 def test_unconfirmed_store_is_reported_as_unconfirmed(qapp):
@@ -367,14 +367,105 @@ def test_unconfirmed_store_is_reported_as_unconfirmed(qapp):
     view._on_download_finished(
         AcquisitionResult(status=AcquisitionStatus.READY, model_id="m")
     )
-    assert "no lo confirma" in view._status.text()
-    assert "no confirmado" in view._detail.text()
+    assert "sin confirmación del almacén local: m." in view._status.text()
+    assert "sin confirmación del almacén local: m." in view._detail.text()
+    assert "Variante: no informada por el catálogo" in view._detail.text()
+
+
+def test_already_downloaded_is_reported_separately(qapp):
+    from castlearq_desktop.core.download_service import (
+        AcquisitionResult,
+        AcquisitionStatus,
+    )
+
+    view, _ = _view_with_downloader(qapp)
+    view._list.item(0).setCheckState(Qt.Checked)
+    view._on_download_finished(
+        AcquisitionResult(
+            status=AcquisitionStatus.ALREADY_DOWNLOADED,
+            model_id="m",
+            filename="m.gguf",
+        )
+    )
+    assert "ya estaba descargado" in view._status.text()
+    assert "ya estaba descargado" in view._detail.text()
+    assert view._download_button.isEnabled() is True
+
+
+def test_failed_acquisition_is_persistent_and_emits_acquisition_failed(qapp):
+    from castlearq_desktop.core.download_service import AcquisitionStatus
+
+    messages: list[str] = []
+    view, _ = _view_with_downloader(qapp)
+    view.acquisition_failed.connect(messages.append)
+    view._on_download_failed("no se pudo conectar al Core")
+
+    assert "Descarga fallida: no se pudo conectar al Core" in view._status.text()
+    assert view._downloading is False
+    assert messages == ["no se pudo conectar al Core"]
+    # A subsequent generic catalog state does not overwrite the failure.
+    view._on_failed("un error irrelevante")
+    assert "Descarga fallida" in view._status.text()
+
+
+def test_error_acquisition_is_persistent_and_emits_acquisition_failed(qapp):
+    messages: list[str] = []
+    view, _ = _view_with_downloader(qapp)
+    view.acquisition_failed.connect(messages.append)
+    view._on_download_error("error inesperado de ejecución")
+
+    assert "Error de descarga: error inesperado de ejecución" in view._status.text()
+    assert view._downloading is False
+    assert messages == ["error inesperado de ejecución"]
+    # A subsequent generic catalog state does not overwrite the error.
+    view._on_failed("un error irrelevante")
+    assert "Error de descarga" in view._status.text()
+
+
+def test_download_button_disabled_during_download(qapp):
+    from castlearq_desktop.core.download_service import (
+        AcquisitionResult,
+        AcquisitionStatus,
+    )
+
+    view, downloader = _view_with_downloader(qapp)
+    view._list.item(0).setCheckState(Qt.Checked)
+    downloader.started.emit()
+    assert view._downloading is True
+    assert view._download_button.isEnabled() is False
+    downloader.finished.emit(
+        AcquisitionResult(status=AcquisitionStatus.READY, model_id="m")
+    )
+    assert view._downloading is False
+    assert view._download_button.isEnabled() is True
+
+
+def test_acquisition_message_is_not_overwritten_by_catalog_state(qapp):
+    from castlearq_desktop.core.download_service import (
+        AcquisitionResult,
+        AcquisitionStatus,
+    )
+
+    view, _ = _view_with_downloader(qapp)
+    view._on_download_finished(
+        AcquisitionResult(
+            status=AcquisitionStatus.READY,
+            model_id="m",
+            filename="m.gguf",
+            store_state=StoreState.VERIFIED,
+        )
+    )
+    success_text = view._status.text()
+    # A later catalog query succeeds with no models; it must not clobber the
+    # acquisition result shown in the status line.
+    view._on_finished(CatalogResult(models=[]))
+    assert view._status.text() == success_text
+    assert "verificado por el Core" in view._status.text()
 
 
 def test_invalidate_clears_the_download_state(qapp):
     view, downloader = _view_with_downloader(qapp)
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     view.invalidate()
 
     assert downloader.invalidated is True
@@ -391,7 +482,6 @@ def test_variant_choices_follow_the_selected_model(qapp):
     view, _ = _view_with_downloader(qapp, models)
 
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     assert view._variant_combo is not None
     assert view._variant_combo.count() == 2
 
@@ -415,7 +505,6 @@ def test_selected_quantization_is_propagated_to_the_request(qapp):
     )
     view, downloader = _view_with_downloader(qapp, [entry])
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
 
     assert view._variant_combo is not None
     view._variant_combo.setCurrentText("Q8_0")
@@ -427,7 +516,6 @@ def test_selected_quantization_is_propagated_to_the_request(qapp):
 def test_request_carries_no_quantization_without_variants(qapp):
     view, downloader = _view_with_downloader(qapp)
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     view._on_download_clicked()
 
     assert downloader.requests[0].quantization is None
@@ -444,12 +532,10 @@ def test_variants_of_a_previous_model_do_not_leak_into_the_next(qapp):
     view, downloader = _view_with_downloader(qapp, models)
 
     view._list.item(0).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(0))
     assert view._variant_combo is not None
     assert view._variant_combo.count() == 2
 
     view._list.item(1).setCheckState(Qt.Checked)
-    view._on_item_clicked(view._list.item(1))
     # The second model declares a single quantization, so no combo remains.
     assert view._variant_combo is None
     view._on_download_clicked()
@@ -633,8 +719,8 @@ def test_local_availability_follows_the_selected_model(qapp):
     assert "Sin artefactos locales para este modelo" in view._local_detail.text()
     assert "a.gguf" not in view._local_detail.text()
 
-    # Deselecting clears the section entirely.
-    view._on_item_clicked(view._list.item(1))
+    # Deselecting via a real checkbox event clears the section entirely.
+    view._list.item(1).setCheckState(Qt.Unchecked)
     assert view._local_detail.text() == ""
     assert view.selected_entry is None
 
@@ -663,3 +749,112 @@ def test_set_local_artifacts_does_not_replace_the_acquisition_detail(qapp):
     assert view._detail.text() == acquisition_detail
     assert "Disponibilidad local" in view._local_detail.text()
     assert "qwen-Q4_K_M.gguf" in view._local_detail.text()
+
+
+# --- Real Qt event behavior (row click / checkbox) ---------------------------
+
+
+def test_row_press_selects_downloadable_model_and_enables_download(qapp):
+    view, _ = _view_with_downloader(qapp)
+    item = view._list.item(0)
+    assert item.checkState() != Qt.Checked
+    view._list.itemClicked.emit(item)  # real row press, no manual handler call
+    assert view.selected_entry is not None
+    assert view.selected_entry.model_id == _entry().model_id
+    assert item.checkState() == Qt.Checked
+    assert view._download_button.isEnabled() is True
+
+
+def test_real_checkbox_check_selects_model(qapp):
+    view, _ = _view_with_downloader(qapp)
+    view._list.item(0).setCheckState(Qt.Checked)  # real itemChanged event
+    assert view.selected_entry is not None
+    assert view.selected_entry.model_id == _entry().model_id
+    assert view._download_button.isEnabled() is True
+
+
+def test_second_row_press_replaces_selection_exclusively(qapp):
+    models = [_entry(model_id="model-a"), _entry(model_id="model-b")]
+    view, _ = _view_with_downloader(qapp, models)
+    view._list.itemClicked.emit(view._list.item(0))
+    assert view.selected_entry.model_id == "model-a"
+    view._list.itemClicked.emit(view._list.item(1))
+    assert view.selected_entry.model_id == "model-b"
+    assert view._list.item(0).checkState() != Qt.Checked
+    assert view._list.item(1).checkState() == Qt.Checked
+    assert view._download_button.isEnabled() is True
+
+
+def test_real_checkbox_uncheck_clears_selection_and_disables_download(qapp):
+    view, _ = _view_with_downloader(qapp)
+    view._list.item(0).setCheckState(Qt.Checked)
+    assert view.selected_entry is not None
+    view._list.item(0).setCheckState(Qt.Unchecked)  # real user uncheck
+    assert view.selected_entry is None
+    assert view._download_button.isEnabled() is False
+
+
+def test_non_downloadable_row_press_never_enables_download(qapp):
+    view, _ = _view_with_downloader(qapp, [_entry(downloadable=False)])
+    view._list.itemClicked.emit(view._list.item(0))
+    assert view.selected_entry is not None
+    assert view._download_button.isEnabled() is False
+
+
+def test_no_downloader_row_press_keeps_download_disabled(qapp):
+    controller = CatalogController(is_ready=lambda: True)
+    view = ModelExplorerView(controller=controller, parent=None)
+    view._populate((_entry(),))
+    view._list.itemClicked.emit(view._list.item(0))
+    assert view.selected_entry is not None
+    assert view._download_button.isEnabled() is False
+
+
+def test_download_disabled_while_acquisition_in_progress(qapp):
+    view, _ = _view_with_downloader(qapp)
+    view._list.itemClicked.emit(view._list.item(0))
+    assert view._download_button.isEnabled() is True
+    view._on_download_started()
+    view._update_download_button()
+    assert view._download_button.isEnabled() is False
+
+
+def test_row_press_then_download_sends_model_and_quantization(qapp):
+    from castlearq_desktop.core.model_catalog import ModelEntry
+
+    entry = ModelEntry(
+        model_id="qwen2.5-coder-7b-instruct",
+        name="Qwen2.5-Coder 7B Instruct",
+        provider="Qwen",
+        family="Qwen2.5-Coder",
+        task="coding",
+        architecture="Transformer",
+        parameter_count_b=7.0,
+        context_length=32768,
+        supported_runtimes=("llama.cpp / llama.app",),
+        supported_backends=("Vulkan", "CPU"),
+        quantizations=("Q4_K_M", "Q8_0"),
+        downloadable=True,
+    )
+    view, downloader = _view_with_downloader(qapp, [entry])
+    view._list.itemClicked.emit(view._list.item(0))
+    view._variant_combo.setCurrentText("Q8_0")
+    view._on_download_clicked()  # uses the test double; no real download
+    assert len(downloader.requests) == 1
+    assert downloader.requests[0].model_id == "qwen2.5-coder-7b-instruct"
+    assert downloader.requests[0].quantization == "Q8_0"
+
+
+def test_selection_signals_keep_semantics_without_duplicates(qapp):
+    view, _ = _view_with_downloader(qapp)
+    selected, unselected = [], []
+    view.model_selected.connect(lambda e: selected.append(e.model_id))
+    view.model_unselected.connect(lambda: unselected.append(True))
+    view._list.itemClicked.emit(view._list.item(0))
+    view._list.itemClicked.emit(view._list.item(0))
+    assert view.selected_entry is not None
+    view._list.item(0).setCheckState(Qt.Unchecked)
+    assert view.selected_entry is None
+    assert len(selected) >= 1
+    assert all(m == _entry().model_id for m in selected)
+    assert unselected == [True]

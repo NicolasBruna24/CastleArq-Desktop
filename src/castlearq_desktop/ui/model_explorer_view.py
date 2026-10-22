@@ -103,6 +103,10 @@ class ModelExplorerView(QWidget):
     #: Emitted when an acquisition ends, so the local library can be
     #: refreshed afterwards. The catalog state stays independent from it.
     acquisition_finished = Signal(object)  # AcquisitionResult
+    #: Emitted when an acquisition fails to start or ends in error, so the
+    #: main window also learns about failures (which must never look like a
+    #: success nor schedule a library selection).
+    acquisition_failed = Signal(str)  # human-readable message from the service
 
     def __init__(
         self,
@@ -160,6 +164,11 @@ class ModelExplorerView(QWidget):
         self._downloader: Optional[ModelAcquisitionService] = None
         self._downloading = False
         self._updating_selection = False
+        self._just_unchecked_by_user: object | None = None
+        #: Last acquisition outcome shown in the status line. It is kept so a
+        #: later generic catalog state does not silently replace an important
+        #: download result; a new explicit catalog check clears it.
+        self._acquisition_message: str | None = None
         #: ``None`` until a *correct* library query delivers its full result;
         #: an empty tuple means "Core lists no artifacts". While ``None``
         #: nothing is claimed about local availability.
@@ -172,7 +181,9 @@ class ModelExplorerView(QWidget):
         controller.already_running.connect(self._on_already)
         controller.check_finished.connect(self._on_finished)
         controller.check_failed.connect(self._on_failed)
-        self._list.itemChanged.connect(self._on_item_clicked)
+        self._list.itemChanged.connect(self._on_item_changed)
+        self._list.itemClicked.connect(self._on_item_pressed)
+        self._list.currentItemChanged.connect(self._on_current_item_changed)
 
     # -- Download (one-shot Core CLI acquisition) ---------------------------
     def set_downloader(self, downloader: Optional[ModelAcquisitionService]) -> None:
@@ -193,47 +204,69 @@ class ModelExplorerView(QWidget):
 
     def _on_download_started(self) -> None:
         self._downloading = True
+        self._acquisition_message = None
         self._status.setText("Descargando desde CastleArq Core…")
+        self._update_download_button()
 
     def _on_download_progress(self, line: str) -> None:
-        self._status.setText(line if line else self._status.text())
+        if line:
+            self._status.setText(line)
+        self._update_download_button()
 
     def _on_download_finished(self, result: AcquisitionResult) -> None:
-        self._download_result = result
         self._downloading = False
+        self._download_result = result
         self.acquisition_finished.emit(result)
-        lines = [f"  Modelo: {result.model_id}"]
-        if result.filename:
-            lines.append(f"  Variante: {result.filename}")
-        if result.destination:
-            lines.append(f"  Destino: {result.destination}")
-        if result.manifest_path:
-            lines.append(f"  Registro local: {result.manifest_path}")
-        lines.append(f"  Estado en el almacén: {_store_state_text(result.store_state)}")
-        if result.message:
-            lines.append(result.message)
-        self._detail.setText("\n".join(lines) if lines else "")
-        self._update_download_button()
-        if result.status == AcquisitionStatus.ALREADY_DOWNLOADED:
-            self._status.setText("El modelo ya estaba descargado (informe del Core).")
+        model = result.model_id or "desconocido"
+        destination = result.destination or "destino no informado por el Core"
+        manifest = result.manifest_path or "registro no informado por el Core"
+        message = result.message or ""
+        if result.status is AcquisitionStatus.ALREADY_DOWNLOADED:
+            status_text = f"El modelo {model} ya estaba descargado (informe del Core)."
         elif result.store_verified:
-            self._status.setText("Descarga completada y verificada por el Core.")
-        elif result.store_confirmed:
-            self._status.setText("Descarga completada (el Core lo registra como descargado).")
-        else:
-            self._status.setText(
-                "Descarga completada según el Core; el almacén local no lo confirma."
+            status_text = (
+                f"Descarga completada y artefacto verificado por el Core: {model}."
             )
+        elif result.store_confirmed:
+            status_text = (
+                f"Descarga completada (registrada como descargada por el Core,"
+                f" no verificada): {model}."
+            )
+        else:
+            status_text = (
+                f"Descarga completada según el Core, sin confirmación del"
+                f" almacén local: {model}."
+            )
+        self._acquisition_message = status_text
+        self._status.setText(status_text)
+        lines = [f"Modelo: {model}"]
+        if result.filename:
+            lines.append(f"Variante: {result.filename}")
+        else:
+            lines.append("Variante: no informada por el catálogo")
+        lines.append(f"Destino: {destination}")
+        lines.append(f"Registro: {manifest}")
+        lines.append(f"Estado en el almacén: {status_text}")
+        if message and message not in status_text:
+            lines.append(f"Informe del Core: {message}")
+        self._detail.setText("\n".join(lines))
+        self._update_download_button()
 
     def _on_download_failed(self, message: str) -> None:
         self._downloading = False
-        self._status.setText(f"Descarga fallida: {message}")
+        self._download_result = None
+        self._acquisition_message = f"Descarga fallida: {message}"
+        self._status.setText(self._acquisition_message)
         self._update_download_button()
+        self.acquisition_failed.emit(message)
 
     def _on_download_error(self, message: str) -> None:
         self._downloading = False
-        self._status.setText(f"Error de descarga: {message}")
+        self._download_result = None
+        self._acquisition_message = f"Error de descarga: {message}"
+        self._status.setText(self._acquisition_message)
         self._update_download_button()
+        self.acquisition_failed.emit(message)
 
     def _update_download_button(self) -> None:
         if self._downloader is None:
@@ -280,36 +313,96 @@ class ModelExplorerView(QWidget):
     def _on_already(self) -> None:
         pass  # button already disabled during check
 
-    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+    def _on_item_changed(self, item: QListWidgetItem) -> None:
+        """React to a checkbox state change (``itemChanged`` post-state).
+
+        The signal reports the *new* state, so ``Checked`` means the user
+        just checked the box and the model must become selected — never
+        deselected. Programmatic changes made under ``_updating_selection``
+        are ignored to avoid recursion.
+        """
         entry = item.data(Qt.UserRole)
         if entry is None:
             return
         if self._updating_selection:
-            # The state change that triggered this handler is our own; acting
-            # on it again would toggle the selection back and recurse.
             return
         if item.checkState() == Qt.Checked:
-            # Deselect this model
-            self._set_check_state(item, Qt.Unchecked)
-            self.model_unselected.emit()
-            self._update_detail(None)
-            self._refresh_variant_choices(None)
-            self._update_download_button()
+            self._select_item(item)
         else:
-            # Select this model: uncheck all others, check this one
-            self._updating_selection = True
-            try:
-                for i in range(self._list.count()):
-                    other = self._list.item(i)
-                    if other is not item and other.checkState() == Qt.Checked:
-                        other.setCheckState(Qt.Unchecked)
+            self._just_unchecked_by_user = item
+            self._deselect_if_no_selection()
+
+    def _on_item_pressed(self, item: QListWidgetItem) -> None:
+        """Select on row press so the highlight matches the internal state.
+
+        A press that Qt reports right after a user-driven uncheck of the
+        same box is the checkbox toggle itself: re-selecting here would
+        make unchecking impossible, so it is ignored.
+        """
+        if item.data(Qt.UserRole) is None:
+            return
+        if self._just_unchecked_by_user is item:
+            self._just_unchecked_by_user = None
+            return
+        self._just_unchecked_by_user = None
+        if item.checkState() != Qt.Checked:
+            self._select_item(item)
+        else:
+            self._list.setCurrentItem(item)
+
+    def _on_current_item_changed(
+        self, current: QListWidgetItem | None, _previous: object
+    ) -> None:
+        """Keep keyboard/highlight navigation in sync with the checkbox state."""
+        if self._updating_selection:
+            return
+        if current is None or current.data(Qt.UserRole) is None:
+            return
+        if current.checkState() != Qt.Checked:
+            self._select_item(current)
+
+    def _on_item_clicked(self, item: QListWidgetItem) -> None:
+        """Backward-compatible entry point kept for existing callers/tests.
+
+        A direct call is treated as an explicit row click, which always
+        selects the model exclusively.
+        """
+        if item.data(Qt.UserRole) is None:
+            return
+        if self._updating_selection:
+            return
+        self._select_item(item)
+
+    def _select_item(self, item: QListWidgetItem) -> None:
+        """Make ``item`` the exclusive selection and refresh dependents."""
+        entry = item.data(Qt.UserRole)
+        if entry is None:
+            return
+        self._just_unchecked_by_user = None
+        self._updating_selection = True
+        try:
+            for i in range(self._list.count()):
+                other = self._list.item(i)
+                if other is not item and other.checkState() == Qt.Checked:
+                    other.setCheckState(Qt.Unchecked)
+            if item.checkState() != Qt.Checked:
                 item.setCheckState(Qt.Checked)
-            finally:
-                self._updating_selection = False
-            self.model_selected.emit(entry)
-            self._update_detail(entry)
-            self._refresh_variant_choices(entry)
-            self._update_download_button()
+            self._list.setCurrentItem(item)
+        finally:
+            self._updating_selection = False
+        self.model_selected.emit(entry)
+        self._update_detail(entry)
+        self._refresh_variant_choices(entry)
+        self._update_download_button()
+
+    def _deselect_if_no_selection(self) -> None:
+        """Refresh dependents when the user unchecked the last box."""
+        if self.selected_entry is not None:
+            return
+        self.model_unselected.emit()
+        self._update_detail(None)
+        self._refresh_variant_choices(None)
+        self._update_download_button()
 
     def _set_check_state(self, item: QListWidgetItem, state: Qt.CheckState) -> None:
         """Change one item's check state without re-entering the handler."""
@@ -377,19 +470,25 @@ class ModelExplorerView(QWidget):
         self._last_models = models
         self._has_valid_catalog = True
         self._populate(models)
-        if not models:
-            self._status.setText(_EMPTY_TEXT)
-        else:
-            self._status.setText(f"{len(models)} modelo(s) disponible(s)")
+        # A fresh catalog result may arrive while an acquisition message is
+        # still shown: keep the acquisition feedback until the user interacts
+        # with the catalog again, so a download result is never silently
+        # replaced by a generic catalog line.
+        if self._acquisition_message is None:
+            if not models:
+                self._status.setText(_EMPTY_TEXT)
+            else:
+                self._status.setText(f"{len(models)} modelo(s) disponible(s)")
         self._update_download_button()
 
     def _on_failed(self, message: str) -> None:
         self._button.setEnabled(True)
         self._detail.setText("")
-        if self._has_valid_catalog:
-            self._status.setText(f"{message} — {_ERROR_STALE}")
-        else:
-            self._status.setText(message)
+        if self._acquisition_message is None:
+            if self._has_valid_catalog:
+                self._status.setText(f"{message} — {_ERROR_STALE}")
+            else:
+                self._status.setText(message)
 
     def _populate(self, models: tuple) -> None:
         self._list.clear()
