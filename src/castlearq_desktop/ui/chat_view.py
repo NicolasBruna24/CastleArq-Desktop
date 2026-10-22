@@ -69,6 +69,7 @@ class ChatView(QWidget):
         self._service = service
         self._artifact: Optional[LocalArtifact] = None
         self._session_id: Optional[str] = None
+        self._awaiting_turn: bool = False
 
         box = QGroupBox(_TITLE, self)
         layout = QVBoxLayout(box)
@@ -124,6 +125,7 @@ class ChatView(QWidget):
     def set_artifact(self, artifact: Optional[LocalArtifact]) -> None:
         """Select (or clear) the artifact the chat will be opened for."""
         self._artifact = artifact
+        self._awaiting_turn = False
         if self._session_id is not None:
             # An open session belongs to the previous artifact: it is closed
             # on Core so no runtime outlives the change.
@@ -174,6 +176,7 @@ class ChatView(QWidget):
             return
         self._prompt.clear()
         self._append(f"Tú: {prompt}")
+        self._awaiting_turn = True
 
     def _on_close(self) -> None:
         """Close the session on Core and drop the visible history."""
@@ -183,6 +186,7 @@ class ChatView(QWidget):
         """Close the Core session (if any) and reset the view."""
         self._service.close_session()
         self._session_id = None
+        self._awaiting_turn = False
         self._history.clear()
         self._prompt.clear()
         self._prompt.setEnabled(False)
@@ -200,6 +204,7 @@ class ChatView(QWidget):
         """Drop pending results (window close / Core shutdown)."""
         self._service.invalidate()
         self._session_id = None
+        self._awaiting_turn = False
         self._history.clear()
         self._prompt.setEnabled(False)
         self._update_controls()
@@ -213,10 +218,16 @@ class ChatView(QWidget):
         self._update_controls()
 
     def _on_turn_completed(self, response: str, turn_count: int) -> None:
+        self._awaiting_turn = False
         self._append(f"Core ({turn_count}): {response}")
         self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
 
     def _on_failed(self, message: str) -> None:
+        if self._awaiting_turn:
+            # The accepted turn did not complete: record the failure in the
+            # conversation without touching earlier messages.
+            self._awaiting_turn = False
+            self._append(f"Error: {message}")
         self._status.setText(message)
         self._update_controls()
 

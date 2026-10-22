@@ -338,3 +338,44 @@ def test_a_rejected_send_keeps_history_and_feedback(view) -> None:
     assert widget._history.toPlainText() == history_before
     assert "adios" not in widget._history.toPlainText()
     assert widget._prompt.toPlainText() == "adios"
+
+
+def test_an_accepted_turn_that_fails_records_an_error_marker(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+
+    history_before = widget._history.toPlainText()
+    widget._on_failed("El Core está ocupado")
+
+    assert "Error: El Core está ocupado" in widget._history.toPlainText()
+    assert history_before in widget._history.toPlainText()
+    assert "ocupado" in widget._status.text()
+
+
+def test_a_completed_turn_clears_pending_state(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+
+    widget._on_turn_completed("respuesta", 1)
+    history_before = widget._history.toPlainText()
+    widget._on_failed("fallo tardío")
+
+    assert widget._history.toPlainText() == history_before
+    assert "fallo tardío" not in widget._history.toPlainText()
+
+
+def test_a_session_open_failure_is_not_attributed_to_a_turn(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+
+    widget._on_failed("No hay una sesión de chat abierta.")
+
+    assert "Error:" not in widget._history.toPlainText()
