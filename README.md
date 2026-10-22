@@ -155,19 +155,14 @@ input; DEC-A dynamics engage through the coordinator's installed-version
 provider, so production `READY` is unreachable until a version is both
 matched and allowlisted.
 
-The allowlist currently contains exactly one version: `0.5.1`, explicitly
-admitted after real verification against an isolated Core `0.5.1`
-installation (installed version equals the `/health` version across
-launch/readiness, plus readiness success — exercised end-to-end by the
-opt-in runtime integration suite, which reaches `READY` with a real Core).
+The allowlist explicitly admits two versions: `0.5.1` and `0.6.0`,
+ratified under DEC-A (see `docs/adr-0005-core-version-admission.md`).
 Admission is exact-version only (no ranges, no wildcards): any other
 version, including newer Core releases from PyPI or GitHub, is not
 automatically compatible and stays fail-closed until it is separately
-verified against an actual Core install (installed version equals the
-`/health` version across launch/readiness, plus readiness success) and
-explicitly added to the allowlist. Automated tests with doubles and an
-explicit test-only allowlist entry remain isolated verification of the
-policy logic.
+audited, verified against integration requirements, and explicitly added
+to the allowlist. Automated tests with doubles and an explicit test-only
+allowlist entry remain isolated verification of the policy logic.
 
 ## Lifecycle and shutdown
 
@@ -193,9 +188,9 @@ policy logic.
 ## Setup
 
 Requirements: Linux; Python 3.11 or newer; PySide6 6.5 or newer; and
-CastleArq Core **exactly `0.5.1`, installed separately in the interpreter you
+CastleArq Core **either `0.5.1` or `0.6.0`, installed separately in the interpreter you
 select** (Desktop never installs or upgrades Core for you — see the Core
-project's own installation instructions for `castlearq==0.5.1`). Other
+project's own installation instructions). Other
 platforms are not validated and no native installers (AppImage, `.deb`) are
 provided in this preview.
 
@@ -222,10 +217,10 @@ has the `castlearq` package installed, then press *Start Core*.
 1. Start the application with `castlearq-desktop` (or
    `python -m castlearq_desktop`).
 2. Click **“Select Python interpreter…”** and choose the absolute path of the
-   Python interpreter that has CastleArq Core `0.5.1` installed. The choice
-   is persisted via `QSettings`; nothing is launched until you request it.
+   Python interpreter that has an admitted CastleArq Core version (`0.5.1` or `0.6.0`) installed.
+   The choice is persisted via `QSettings`; nothing is launched until you request it.
 3. Click **“Start Core”**. If the interpreter path is invalid, Core is not
-   installed there, its version is not exactly `0.5.1`, Core is unreachable,
+   installed there, its version is not an admitted version (`0.5.1` or `0.6.0`), Core is unreachable,
    or readiness fails, the status line reports the cause with an actionable
    message (missing distribution, version mismatch, transport failure, or
    timeout) instead of starting.
@@ -248,7 +243,7 @@ Two suites exist, with different purposes:
   Deterministic; processes, clocks, timers, and HTTP are faked or simulated.
   Tests that require Qt skip automatically when PySide6 is unavailable. The
   test extra (`pip install -e ".[test]"`) is for development only; running
-  the application itself needs just the base install plus Core `0.5.1`.
+  the application itself needs just the base install plus Core `0.5.1` or `0.6.0`.
 
 - **Runtime integration tests** (opt-in only):
 
@@ -273,13 +268,13 @@ Two suites exist, with different purposes:
 
 ## Known limitations
 
-- **DEC-A admits exactly one version** — production readiness admission is
+- **DEC-A admits exactly two versions** — production readiness admission is
   fail-closed (`VersionAdmission.NOT_EVALUATED` as the static input plus
   conservative per-pass version comparison), so a readiness success state
-  requires a matched version that is explicitly allowlisted. Today that is
-  only `0.5.1` (real-verified against an isolated Core `0.5.1` install);
+  requires a matched version that is explicitly allowlisted. Today those are
+  `0.5.1` and `0.6.0` (see `docs/adr-0005-core-version-admission.md`);
   every other version — including newer Core releases — stays fail-closed
-  until separately verified against a real Core install and explicitly
+  until separately audited against contract requirements and explicitly
   added to the allowlist.
 - No conversation persistence is implemented: chat history lives in the
   running Core session and is deleted when the session closes; closing the
