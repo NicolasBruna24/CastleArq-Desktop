@@ -119,3 +119,83 @@ def test_consume_pending_on_finished(app):
         service.refresh.assert_called_once()
     finally:
         window.close()
+def test_acquisition_finished_success_sets_pending_and_refreshes(app):
+    window = _window(app)
+    try:
+        library = MagicMock()
+        service = MagicMock()
+        service.is_busy = False
+        service.refresh.return_value = True
+        chat_view = MagicMock()
+        chat_view.has_session = False
+        window._local_library = library
+        window._local_library_service = service
+        window._chat_view = chat_view
+
+        result = MagicMock()
+        result.succeeded = True
+        result.model_id = "m"
+        result.filename = "f.gguf"
+
+        window._on_acquisition_finished(result)
+
+        library.set_pending_selection.assert_called_once_with("m", "f.gguf")
+        library.clear_pending_selection.assert_not_called()
+        service.refresh.assert_called_once()
+        assert window._pending_library_refresh is False
+    finally:
+        window.close()
+
+
+def test_acquisition_finished_failure_clears_pending_and_refreshes(app):
+    window = _window(app)
+    try:
+        library = MagicMock()
+        service = MagicMock()
+        service.is_busy = True
+        chat_view = MagicMock()
+        chat_view.has_session = False
+        window._local_library = library
+        window._local_library_service = service
+        window._chat_view = chat_view
+
+        result = MagicMock()
+        result.succeeded = False
+        result.model_id = "m"
+        result.filename = "f.gguf"
+
+        window._on_acquisition_finished(result)
+
+        library.clear_pending_selection.assert_called_once()
+        library.set_pending_selection.assert_not_called()
+        service.refresh.assert_not_called()
+        assert window._pending_library_refresh is True
+    finally:
+        window.close()
+
+
+def test_acquisition_finished_session_active_clears_pending(app):
+    window = _window(app)
+    try:
+        library = MagicMock()
+        service = MagicMock()
+        service.is_busy = False
+        service.refresh.return_value = True
+        chat_view = MagicMock()
+        chat_view.has_session = True
+        window._local_library = library
+        window._local_library_service = service
+        window._chat_view = chat_view
+
+        result = MagicMock()
+        result.succeeded = True
+        result.model_id = "m"
+        result.filename = "f.gguf"
+
+        window._on_acquisition_finished(result)
+
+        library.clear_pending_selection.assert_called_once()
+        library.set_pending_selection.assert_not_called()
+        service.refresh.assert_called_once()
+    finally:
+        window.close()
