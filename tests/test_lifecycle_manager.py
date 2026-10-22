@@ -209,6 +209,123 @@ def test_observe_unexpected_exit_running():
     assert mgr.state is LifecycleState.UNEXPECTED_EXIT
 
 
+def test_unexpected_exit_preserves_nonzero_exit_code():
+    mgr, adapter, _ = make()
+    mgr.start(ABS_PYTHON)
+    adapter.handle.exit(1)
+    mgr.observe()
+    assert mgr.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code == 1
+    assert mgr.last_exit_code is not None
+
+
+def test_unexpected_exit_preserves_zero_exit_code():
+    mgr, adapter, _ = make()
+    mgr.start(ABS_PYTHON)
+    adapter.handle.exit(0)
+    mgr.observe()
+    assert mgr.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code == 0
+
+
+def test_unexpected_exit_unknown_exit_code():
+    mgr, adapter, _ = make()
+    mgr.start(ABS_PYTHON)
+    # poll() reports None but is_alive() reports dead: confirmed exit,
+    # but no numeric exit code available.
+    mgr._handle = FakeHandle(alive=False, exit_code=None)
+    adapter.handle = mgr._handle
+    mgr.observe()
+    assert mgr.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code is None
+
+
+def test_immediate_exit_preserves_exit_code_and_pid():
+    mgr, adapter, _ = make("immediate-exit")
+    res = mgr.start(ABS_PYTHON)
+    assert res.status == "failed"
+    assert res.state is LifecycleState.UNEXPECTED_EXIT
+    assert res.context["exit_code"] == 3
+    assert mgr.last_exit_code == 3
+    assert mgr.last_pid is None  # FakeHandle does not provide a pid
+
+
+def test_pid_only_when_handle_provides_it():
+    # Handle that provides a pid.
+    class PidHandle(FakeHandle):
+        pid = 4242
+
+    mgr, adapter, _ = make()
+    mgr.start(ABS_PYTHON)
+    ph = PidHandle(alive=True)
+    adapter.handle = ph
+    mgr._handle = ph
+    ph.exit(5)
+    mgr.observe()
+    assert mgr.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code == 5
+    assert mgr.last_pid == 4242
+
+    # Handle without a pid attribute: pid stays None, exit code still kept.
+    mgr2, adapter2, _ = make()
+    mgr2.start(ABS_PYTHON)
+    adapter2.handle.exit(2)
+    mgr2.observe()
+    assert mgr2.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr2.last_exit_code == 2
+    assert mgr2.last_pid is None
+
+
+def test_requested_shutdown_produces_stopped_not_unexpected_exit():
+    mgr, adapter, _ = make()
+    mgr.start(ABS_PYTHON)
+    mgr.stop()
+    adapter.handle.exit(0)
+    mgr.observe()
+    assert mgr.state is LifecycleState.STOPPED
+    assert mgr.state is not LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code == 0
+
+
+def test_unexpected_exit_context_has_no_traceback_markers():
+    mgr, adapter, _ = make("immediate-exit")
+    res = mgr.start(ABS_PYTHON)
+    assert res.state is LifecycleState.UNEXPECTED_EXIT
+    for key, value in res.context.items():
+        if isinstance(value, str):
+            assert "Traceback" not in value
+            assert 'File "' not in value
+
+
+def test_retry_from_unexpected_exit_resets_previous_pid():
+    class PidHandle(FakeHandle):
+        pid = 9999
+
+    mgr, adapter, _ = make("immediate-exit")
+    adapter.handle = PidHandle()
+    res = mgr.start(ABS_PYTHON)
+    # 1. La ejecución termina inesperadamente y conserva su PID.
+    assert res.status == "failed"
+    assert res.state is LifecycleState.UNEXPECTED_EXIT
+    assert mgr.last_exit_code == 3
+    assert mgr.last_pid == 9999
+
+    # 2. Se descarta el handle terminado para permitir un nuevo intento.
+    assert mgr.discard_terminated_handle() is True
+    assert mgr._handle is None
+
+    # 3. Nuevo intento que se mantiene en ejecución (no establece otro PID).
+    adapter.behavior = "ok"
+    adapter.handle = FakeHandle(alive=True)
+    res = mgr.start(ABS_PYTHON)
+    assert res.status == "ok"
+    assert mgr.state is LifecycleState.RUNNING
+    # Antes de que la nueva ejecución establezca otro PID, no se expone
+    # el PID de la ejecución anterior.
+    assert mgr.last_pid is None
+    assert mgr.last_exit_code is None
+
+
 def test_stop_idempotent_no_handle():
     mgr, _, _ = make()
     res = mgr.stop()

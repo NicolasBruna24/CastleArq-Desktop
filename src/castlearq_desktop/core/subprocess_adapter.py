@@ -51,6 +51,11 @@ class SubprocessProcessHandle:
     def popen(self) -> Any:
         return self._popen
 
+    @property
+    def pid(self) -> Optional[int]:
+        """Return the OS process ID of the owned child, if available."""
+        return getattr(self._popen, "pid", None)
+
     def is_alive(self) -> bool:
         # Non-blocking: Popen.poll() returns None while running.
         return self._popen.poll() is None

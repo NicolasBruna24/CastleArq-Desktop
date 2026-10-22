@@ -102,10 +102,21 @@ class LifecycleManager:
     _stop_requested_at: Optional[float] = field(default=None, repr=False)
     _kill_sent: bool = field(default=False, repr=False)
     _last_exit_code: Optional[int] = field(default=None, repr=False)
+    _last_pid: Optional[int] = field(default=None, repr=False)
 
     @property
     def has_owned_handle(self) -> bool:
         return self._handle is not None
+
+    @property
+    def last_exit_code(self) -> Optional[int]:
+        """Exit code of the last observed process termination, or ``None``."""
+        return self._last_exit_code
+
+    @property
+    def last_pid(self) -> Optional[int]:
+        """OS process ID of the last observed child, or ``None`` when unavailable."""
+        return self._last_pid
 
     def _failed(self, state: LifecycleState, code: ErrorCode,
                 message: str, **context: Any) -> OperationResult:
@@ -193,6 +204,7 @@ class LifecycleManager:
                 return self._refused("Discard exited handle first.",
                                      retained_ownership=True)
             self._last_exit_code = None
+            self._last_pid = None
         if self.state is LifecycleState.START_FAILED:
             self._handle = None
         try:
@@ -262,12 +274,14 @@ class LifecycleManager:
         status, code = self._observe_status()
         if status == "exited":
             self._last_exit_code = code
+            self._last_pid = getattr(self._handle, "pid", None)
             self.state = LifecycleState.UNEXPECTED_EXIT
             self.shutdown_phase = ShutdownPhase.IDLE
             return OperationResult(status="failed", state=self.state, error=None,
                                    detail="Exited immediately after launch.",
                                    context={"immediate_exit": True,
-                                            "exit_code": code})
+                                            "exit_code": code,
+                                            "pid": self._last_pid})
         if status == "unknown":
             self.state = LifecycleState.STARTING
             return OperationResult(status="pending", state=self.state,
@@ -372,6 +386,7 @@ class LifecycleManager:
         status, code = self._observe_status()
         if status == "exited":
             self._last_exit_code = code
+            self._last_pid = getattr(handle, "pid", None)
             self._handle = None
             self._stop_requested_at = None
             if self.state is LifecycleState.STOPPING:
