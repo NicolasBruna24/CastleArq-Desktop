@@ -70,6 +70,7 @@ class ChatView(QWidget):
         self._artifact: Optional[LocalArtifact] = None
         self._session_id: Optional[str] = None
         self._awaiting_turn: bool = False
+        self._last_prompt: Optional[str] = None
 
         box = QGroupBox(_TITLE, self)
         layout = QVBoxLayout(box)
@@ -126,6 +127,7 @@ class ChatView(QWidget):
         """Select (or clear) the artifact the chat will be opened for."""
         self._artifact = artifact
         self._awaiting_turn = False
+        self._last_prompt = None
         if self._session_id is not None:
             # An open session belongs to the previous artifact: it is closed
             # on Core so no runtime outlives the change.
@@ -177,6 +179,7 @@ class ChatView(QWidget):
         self._prompt.clear()
         self._append(f"Tú: {prompt}")
         self._awaiting_turn = True
+        self._last_prompt = prompt
 
     def _on_close(self) -> None:
         """Close the session on Core and drop the visible history."""
@@ -187,6 +190,7 @@ class ChatView(QWidget):
         self._service.close_session()
         self._session_id = None
         self._awaiting_turn = False
+        self._last_prompt = None
         self._history.clear()
         self._prompt.clear()
         self._prompt.setEnabled(False)
@@ -205,6 +209,7 @@ class ChatView(QWidget):
         self._service.invalidate()
         self._session_id = None
         self._awaiting_turn = False
+        self._last_prompt = None
         self._history.clear()
         self._prompt.setEnabled(False)
         self._update_controls()
@@ -219,6 +224,7 @@ class ChatView(QWidget):
 
     def _on_turn_completed(self, response: str, turn_count: int) -> None:
         self._awaiting_turn = False
+        self._last_prompt = None
         if response.strip() == "":
             self._append(f"Core ({turn_count}): (sin contenido)")
             self._status.setText(
@@ -234,6 +240,9 @@ class ChatView(QWidget):
             # conversation without touching earlier messages.
             self._awaiting_turn = False
             self._append(f"Error: {message}")
+            if self._prompt.toPlainText().strip() == "" and self._last_prompt is not None:
+                self._prompt.setPlainText(self._last_prompt)
+            self._last_prompt = None
         self._status.setText(message)
         self._update_controls()
 

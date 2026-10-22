@@ -390,6 +390,49 @@ def test_a_session_open_failure_is_not_attributed_to_a_turn(view) -> None:
 
 
 
+def test_a_failed_accepted_turn_restores_the_prompt(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+
+    widget._on_failed("El Core está ocupado")
+
+    assert widget._prompt.toPlainText() == "hola"
+    assert "Error: El Core está ocupado" in widget._history.toPlainText()
+
+
+def test_a_failed_accepted_turn_preserves_new_user_text(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+
+    widget._prompt.setPlainText("texto nuevo")
+    widget._on_failed("El Core está ocupado")
+
+    assert widget._prompt.toPlainText() == "texto nuevo"
+
+
+def test_a_completed_turn_does_not_restore_later(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+
+    widget._on_turn_completed("respuesta", 1)
+    widget._on_failed("fallo tardío")
+
+    assert widget._prompt.toPlainText() == ""
+
+
+
 def test_a_completed_turn_clears_pending_state(view) -> None:
     widget, service = view
     widget.set_artifact(ARTIFACT)
