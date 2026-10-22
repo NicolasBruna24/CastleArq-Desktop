@@ -29,6 +29,7 @@ from castlearq_desktop.core.contracts import HEALTH_PATH
 from castlearq_desktop.core.contracts import MAX_REQUEST_TIMEOUT_SECONDS
 from castlearq_desktop.core.contracts import MODELS_PATH
 from castlearq_desktop.core.contracts import POLL_INTERVAL_SECONDS
+from castlearq_desktop.core.contracts import READINESS_REQUEST_TIMEOUT_SECONDS
 from castlearq_desktop.core.contracts import TRANSPORT_RETRIES_ENABLED
 from castlearq_desktop.core.contracts import VersionAdmission
 from castlearq_desktop.core.readiness_client import HttpProbeResponse
@@ -147,7 +148,35 @@ def test_effective_timeout_uses_remaining_budget():
     assert r.attempts[0].timeout == pytest.approx(2.0)
     assert all(a.timeout == pytest.approx(2.0) for a in r.attempts)
     r2 = c.probe_once(now=0.0, deadline=deadline)
-    assert all(a.timeout == MAX_REQUEST_TIMEOUT_SECONDS for a in r2.attempts)
+    assert all(a.timeout == READINESS_REQUEST_TIMEOUT_SECONDS for a in r2.attempts)
+
+
+def test_fallback_path_uses_the_readiness_timeout_not_the_generic_maximum():
+    """The urllib fallback path must use the readiness-specific cap.
+
+    CastleArq Core 0.6.0 answers ``GET /v1/artifacts`` with HTTP 200 after
+    ~5.5-5.8 s; the generic 4 s cap made every fallback pass time out.
+    """
+    seen = {}
+
+    def _transport(path, *, timeout):
+        seen[path] = timeout
+        return HttpProbeResponse(200)
+
+    c = admitted_client(_transport)
+    deadline = Deadline.starting_now(0.0)
+    # With ample budget the readiness cap (10 s) applies, not the generic 4 s.
+    c.probe_once(now=0.0, deadline=deadline)
+    assert all(t == READINESS_REQUEST_TIMEOUT_SECONDS for t in seen.values())
+    assert all(t > MAX_REQUEST_TIMEOUT_SECONDS for t in seen.values())
+    # Without a deadline the readiness cap is still the one used.
+    seen.clear()
+    c.probe_once(now=0.0, deadline=None)
+    assert all(t == READINESS_REQUEST_TIMEOUT_SECONDS for t in seen.values())
+    # The remaining global budget still wins over the cap.
+    seen.clear()
+    c.probe_once(now=18.0, deadline=deadline)
+    assert all(t == pytest.approx(2.0) for t in seen.values())
 
 
 def test_poll_interval_250ms_and_no_overshoot():
@@ -476,7 +505,10 @@ class QtClock:
 
 
 def make_transport(nam, clock, registry, *, observer=lambda: True,
-                   contract=VersionAdmission.ADMITTED):
+                   contract=VersionAdmission.ADMITTED, request_timeout=None):
+    kwargs = {}
+    if request_timeout is not None:
+        kwargs["request_timeout"] = request_timeout
     return QtReadinessTransport(
         "http://127.0.0.1:8000",
         child_observer=observer,
@@ -484,6 +516,7 @@ def make_transport(nam, clock, registry, *, observer=lambda: True,
         clock=clock,
         timer_factory=lambda: FakeQTimer(registry),
         nam=nam,
+        **kwargs,
     )
 
 
@@ -507,8 +540,8 @@ def test_qt_endpoints_order_and_timer_intervals():
         "http://127.0.0.1:8000/v1/models",
         "http://127.0.0.1:8000/v1/artifacts",
     ]
-    # 3 per-request timers at 4 s, 1 global deadline timer at 20 s
-    assert len(timers_with(reg, int(MAX_REQUEST_TIMEOUT_SECONDS * 1000))) == 3
+    # 3 per-request timers at the readiness cap, 1 global deadline timer at 20 s
+    assert len(timers_with(reg, int(READINESS_REQUEST_TIMEOUT_SECONDS * 1000))) == 3
     assert len(timers_with(reg, int(20.0 * 1000))) == 1
 
 
@@ -563,7 +596,7 @@ def test_qt_request_timeout_aborts_reply():
     results = []
     tr.finished.connect(lambda r: results.append(r))
     tr.start(0.0, Deadline.starting_now(0.0))
-    timers_with(reg, 4000)[0].fire()  # health request times out
+    timers_with(reg, 10000)[0].fire()  # health request times out
     assert nam.requests[0][1].aborted is True
     nam.requests[1][1].succeed(200)
     nam.requests[2][1].succeed(200)
@@ -572,12 +605,47 @@ def test_qt_request_timeout_aborts_reply():
 
 @qt_required
 def test_qt_request_timeout_capped_by_remaining():
-    # Near the deadline the per-request timeout is min(4 s, remaining).
+    # Near the deadline the per-request timeout is min(cap, remaining).
     reg, nam, clock = [], FakeNAM(), QtClock(18.0)
     tr = make_transport(nam, clock, reg)
     tr.start(18.0, Deadline.starting_now(0.0))  # 2 s remaining
-    assert timers_with(reg, 2000)  # capped to remaining 2 s, not 4 s
-    assert not timers_with(reg, 4000)
+    assert timers_with(reg, 2000)  # capped to remaining 2 s, not the 10 s cap
+    assert not timers_with(reg, 10000)
+
+
+@qt_required
+def test_qt_transport_uses_the_readiness_timeout_not_the_generic_maximum():
+    """The production Qt path must arm its timers with the readiness cap.
+
+    CastleArq Core 0.6.0 answers ``GET /v1/artifacts`` with HTTP 200 after
+    ~5.5-5.8 s: with the generic 4 s cap every Qt readiness pass timed out.
+    """
+    reg, nam, clock = [], FakeNAM(), QtClock(0.0)
+    tr = make_transport(nam, clock, reg)
+    tr.start(0.0, Deadline.starting_now(0.0))
+    assert len(timers_with(reg, int(READINESS_REQUEST_TIMEOUT_SECONDS * 1000))) == 3
+    # The generic cap is not used by the readiness transport.
+    assert not timers_with(reg, int(MAX_REQUEST_TIMEOUT_SECONDS * 1000))
+
+
+@qt_required
+def test_qt_transport_request_timeout_is_injectable():
+    """The readiness cap is a parameter, not a hard-coded value."""
+    reg, nam, clock = [], FakeNAM(), QtClock(0.0)
+    tr = make_transport(nam, clock, reg, request_timeout=7.5)
+    tr.start(0.0, Deadline.starting_now(0.0))
+    assert len(timers_with(reg, 7500)) == 3
+    assert not timers_with(reg, int(READINESS_REQUEST_TIMEOUT_SECONDS * 1000))
+
+
+@qt_required
+def test_qt_transport_injected_timeout_still_respects_global_budget():
+    """An injected cap never overrides the remaining global budget."""
+    reg, nam, clock = [], FakeNAM(), QtClock(15.0)
+    tr = make_transport(nam, clock, reg, request_timeout=10.0)
+    tr.start(15.0, Deadline.starting_now(0.0))  # 5 s remaining
+    assert timers_with(reg, 5000)
+    assert not timers_with(reg, 10000)
 
 
 @qt_required

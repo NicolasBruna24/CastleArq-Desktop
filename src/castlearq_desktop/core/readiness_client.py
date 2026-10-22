@@ -36,7 +36,7 @@ explicit ``VersionAdmission`` input (default NOT_EVALUATED, fail-closed).
 Bodies are never parsed; DEC-B success means observed 2xx only.
 
 Temporal guarantee (honest): each request is started only with
-``timeout=min(4 s, remaining)`` and the deadline is additionally checked
+``timeout=min(10 s, remaining)`` and the deadline is additionally checked
 *after* each request via the clock, so an overrun is detected and reported
 as ``READINESS_TIMEOUT`` instead of success. However ``urllib`` CANNOT
 preempt a blocked socket at the exact global deadline: a single request
@@ -61,8 +61,8 @@ from castlearq_desktop.core.contracts import HEALTH_PATH
 from castlearq_desktop.core.contracts import MODELS_PATH
 from castlearq_desktop.core.contracts import Deadline
 from castlearq_desktop.core.contracts import ErrorCode
-from castlearq_desktop.core.contracts import MAX_REQUEST_TIMEOUT_SECONDS
 from castlearq_desktop.core.contracts import POLL_INTERVAL_SECONDS
+from castlearq_desktop.core.contracts import READINESS_REQUEST_TIMEOUT_SECONDS
 from castlearq_desktop.core.contracts import TRANSPORT_RETRIES_ENABLED
 from castlearq_desktop.core.contracts import ProbeObservation
 from castlearq_desktop.core.contracts import ReadinessCondition
@@ -287,9 +287,11 @@ class ReadinessHttpClient:
                 failed.append((path, "deadline"))
                 continue
             if deadline is not None:
-                timeout = deadline.effective_request_timeout(current)
+                timeout = deadline.effective_request_timeout(
+                    current,
+                    max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS)
             else:
-                timeout = MAX_REQUEST_TIMEOUT_SECONDS
+                timeout = READINESS_REQUEST_TIMEOUT_SECONDS
             try:
                 response = self._transport(path, timeout=timeout)
                 status = response.status if response is not None else None

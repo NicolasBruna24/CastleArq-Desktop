@@ -366,7 +366,7 @@ class CoreStartupCoordinator:
         :class:`ReadinessWaitResult` through the checker's ``result`` signal.
         The Qt event loop drives the entire readiness flow: each HTTP request is
         a non-blocking ``QNetworkAccessManager`` GET, and ``QTimer`` drives the
-        per-request timeout (4 s, capped by the global 20 s deadline), the
+        per-request timeout (10 s, capped by the global 20 s deadline), the
         250 ms polling interval, and the global deadline.
 
         The checker is lifecycle-neutral: it cancels only the network requests
