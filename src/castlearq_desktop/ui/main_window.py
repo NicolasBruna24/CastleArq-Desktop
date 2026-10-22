@@ -34,6 +34,7 @@ from PySide6.QtWidgets import (
     QLabel,
     QMainWindow,
     QPushButton,
+    QScrollArea,
     QVBoxLayout,
     QWidget,
 )
@@ -103,8 +104,10 @@ class MainWindow(QMainWindow):
         #: started because another library query was already running.
         self._pending_library_refresh: bool = False
 
+        scroll = QScrollArea(self)
+        scroll.setWidgetResizable(True)
 
-        central = QWidget(self)
+        central = QWidget(scroll)
         layout = QVBoxLayout(central)
         layout.setContentsMargins(24, 24, 24, 24)
         layout.setSpacing(12)
@@ -269,7 +272,9 @@ class MainWindow(QMainWindow):
 
         layout.addStretch(1)
 
-        self.setCentralWidget(central)
+        scroll.setWidget(central)
+
+        self.setCentralWidget(scroll)
         self._connect_controller()
 
     def _on_select_interpreter(self) -> None:
