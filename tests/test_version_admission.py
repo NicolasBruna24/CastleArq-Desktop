@@ -56,14 +56,15 @@ def script_transport(health, *, models=200, artifacts=200):
 
 
 def test_supported_list_admits_candidate():
-    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1"})
-    assert CANDIDATE_VERSION == "0.5.1"
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0"})
+    assert CANDIDATE_VERSION == "0.6.0"
     assert CANDIDATE_VERSION in SUPPORTED_CORE_VERSIONS
 
 def test_strict_version_syntax():
     assert is_valid_version("0.5.1")
+    assert is_valid_version("0.6.0")
     assert is_valid_version(ADMITTED)
-    for bad in [None, "", "  ", " 0.5.1", "0.5.1 ",
+    for bad in [None, "", "  ", " 0.6.0", "0.6.0 ",
                 "a b", "v/1", 123, "x" * 65]:
         assert not is_valid_version(bad)
 
@@ -73,7 +74,7 @@ def test_installed_query_uses_selected_interpreter_only():
 
     class Completed:
         returncode = 0
-        stdout = json.dumps({"distribution_version": "0.5.1"})
+        stdout = json.dumps({"distribution_version": "0.6.0"})
 
     def _execute(argv, **kwargs):
         calls.append((argv, kwargs))
@@ -81,7 +82,7 @@ def test_installed_query_uses_selected_interpreter_only():
 
     out = query_installed_core_version(
         "/abs/env/bin/python", execute=_execute)
-    assert out == "0.5.1"
+    assert out == "0.6.0"
     argv, kwargs = calls[0]
     assert argv[0] == "/abs/env/bin/python"
     assert argv[1] == "-I" and argv[2] == "-c"
@@ -89,7 +90,7 @@ def test_installed_query_uses_selected_interpreter_only():
     assert query_installed_core_version("python") is None
     assert parse_installed_version_output("not-json") is None
     assert parse_installed_version_output(
-        json.dumps({"distribution_version": " 0.5.1"})) is None
+        json.dumps({"distribution_version": " 0.6.0"})) is None
 
 
 def test_match_admitted_allows_ready():
@@ -111,13 +112,13 @@ def test_mismatch_rejected_with_incompatible():
 
 
 def test_matched_but_not_allowlisted_is_unknown_rejected():
-    c = sync_client(script_transport(health_body("0.5.1")),
-                    installed="0.5.1")
+    c = sync_client(script_transport(health_body("0.6.0")),
+                    installed="0.6.0")
     out = c.probe_once(now=0.0)
     assert out.ready is False
     assert out.error_code is ErrorCode.API_CONTRACT_INCOMPATIBLE
     assert classify_version_admission(
-        "0.5.1", "0.5.1",
+        "0.6.0", "0.6.0",
         supported_versions=ALLOW) is VersionAdmission.UNKNOWN
 
 
@@ -177,7 +178,7 @@ def test_failing_extra_endpoints_reject_despite_match():
 def test_rejected_cases_never_report_ready():
     cases = [
         ("0.5.0", health_body(ADMITTED)),
-        ("0.5.1", health_body("0.5.1")),
+        ("0.6.0", health_body("0.6.0")),
         (None, health_body(ADMITTED)),
         (ADMITTED, b"not-json"),
     ]
@@ -396,9 +397,9 @@ def test_m2_qt_body_caps_with_doubles():
 
 
 def test_extract_health_version_shapes():
-    assert extract_health_version({"version": "0.5.1"}) == (True, "0.5.1")
-    assert extract_health_version(b'{"version":"0.5.1"}') == (True, "0.5.1")
-    assert extract_health_version('{"version":"0.5.1"}') == (True, "0.5.1")
+    assert extract_health_version({"version": "0.6.0"}) == (True, "0.6.0")
+    assert extract_health_version(b'{"version":"0.6.0"}') == (True, "0.6.0")
+    assert extract_health_version('{"version":"0.6.0"}') == (True, "0.6.0")
     assert extract_health_version({"other": 1}) == (False, None)
     assert extract_health_version(b"nope") == (False, None)
     assert evaluate_version_admission(

@@ -21,11 +21,11 @@ from castlearq_desktop.core.contracts.readiness import VersionAdmission
 #: explicitly admitted after real verification against an isolated Core
 #: 0.5.1 installation (the really-installed version equals the real
 #: ``/health`` version and readiness succeeds).
-SUPPORTED_CORE_VERSIONS: FrozenSet[str] = frozenset({"0.5.1"})
+SUPPORTED_CORE_VERSIONS: FrozenSet[str] = frozenset({"0.5.1", "0.6.0"})
 
 #: Version covered by the current DEC-A admission decision: ``0.5.1`` is
 #: explicitly admitted (see ``SUPPORTED_CORE_VERSIONS``).
-CANDIDATE_VERSION = "0.5.1"
+CANDIDATE_VERSION = "0.6.0"
 
 #: Approved top-level JSON field carrying the Core version in GET /health.
 HEALTH_VERSION_FIELD = "version"
