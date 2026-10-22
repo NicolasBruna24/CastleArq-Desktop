@@ -129,8 +129,9 @@ endpoint `http://127.0.0.1:8000`:
 - `GET /v1/artifacts` — artifacts API probe.
 
 Timing follows the ratified contract: a 20-second global deadline, at most
-4 seconds per request (always bounded by the remaining global budget), a
-nominal 250 ms polling interval, and no automatic transport retries.
+10 seconds per readiness request and at most 4 seconds for any other HTTP
+request (both always bounded by the remaining global budget), a nominal
+250 ms polling interval, and no automatic transport retries.
 
 **Compatibility admission (DEC-A) is fail-closed and conservative.** For
 every readiness pass Desktop:
