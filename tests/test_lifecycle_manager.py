@@ -18,8 +18,12 @@
 
 from __future__ import annotations
 
+import logging
 import pytest
+from unittest.mock import patch
 
+from castlearq_desktop.core.contracts import (
+    ARTIFACTS_PATH, HEALTH_PATH, MODELS_PATH)
 from castlearq_desktop.core.contracts.errors import APPROVED_ERROR_CODES
 from castlearq_desktop.core.contracts.errors import ErrorCode
 from castlearq_desktop.core.contracts.shutdown import ShutdownPhase
@@ -594,3 +598,143 @@ def test_generic_spawn_exception_is_indeterminate():
     assert mgr.state is LifecycleState.START_FAILED
     assert mgr.start(ABS_PYTHON).status == "refused"
     assert mgr.stop().status == "failed"
+
+
+def test_readiness_transport_module_has_logger():
+    """El transporte de readiness expone un logger dedicado al diagnóstico."""
+    pytest.importorskip("PySide6")
+    import logging
+    from castlearq_desktop.core import (
+        readiness_qt_transport as readiness_qt_transport)
+    assert isinstance(readiness_qt_transport._logger, logging.Logger)
+    assert readiness_qt_transport._logger.name == (
+        "castlearq_desktop.core.readiness_qt_transport")
+
+
+def test_readiness_transport_has_instrumentation_attributes():
+    """El transporte expone los puntos de instrumentación declarados."""
+    pytest.importorskip("PySide6")
+    from unittest.mock import MagicMock
+    from castlearq_desktop.core import (
+        readiness_qt_transport as readiness_qt_transport)
+    QtReadinessTransport = readiness_qt_transport.QtReadinessTransport
+
+    transport = QtReadinessTransport(
+        "http://127.0.0.1:8000",
+        child_observer=lambda: True,
+        api_contract=MagicMock(),
+        clock=MagicMock(),
+        timer_factory=MagicMock(),
+        nam=MagicMock(),
+    )
+    for attr in (
+        "_request_start_times",
+        "_request_durations",
+        "_log_pass",
+        "_issue_request",
+        "_on_reply_finished",
+        "_cleanup",
+    ):
+        assert hasattr(transport, attr), attr
+
+
+def test_log_pass_records_duration_and_not_started(caplog):
+    """_log_pass registra duración real, timeouts y peticiones no iniciadas.
+
+    Se instancia la clase sin llamar a QObject.__init__ (parcheado) para no
+    requerir PySide6 ni tráfico HTTP; solo se prueba la lógica de registro.
+    """
+    pytest.importorskip("PySide6")
+    from castlearq_desktop.core import (
+        readiness_qt_transport as readiness_qt_transport)
+    QtReadinessTransport = readiness_qt_transport.QtReadinessTransport
+
+    with patch.object(QtReadinessTransport, "__init__", lambda self, *a, **k: None):
+        mgr = QtReadinessTransport.__new__(QtReadinessTransport)
+        mgr._passes = 3
+        mgr._alive_before = True
+        mgr._pass_results = {
+            HEALTH_PATH: ("ok", 200, None),
+            MODELS_PATH: ("ok", 200, None),
+            ARTIFACTS_PATH: ("timeout", None, None),
+        }
+        mgr._request_durations = {
+            HEALTH_PATH: 0.041,
+            MODELS_PATH: 0.063,
+            ARTIFACTS_PATH: None,
+        }
+        mgr._deadline = None
+
+        with caplog.at_level(
+            logging.DEBUG,
+            logger="castlearq_desktop.core.readiness_qt_transport",
+        ):
+            mgr._log_pass(
+                now=100.0,
+                alive_after=False,
+                overrun=False,
+                code=ErrorCode.API_PROBE_FAILED,
+                ready=False,
+            )
+
+    assert "pass=3" in caplog.text
+    assert "path=/health kind=ok status=200 duration_ms=41" in caplog.text
+    assert "path=/v1/models kind=ok status=200 duration_ms=63" in caplog.text
+    assert (
+        "path=/v1/artifacts kind=timeout status=None duration_ms=None"
+        in caplog.text
+    )
+    assert "child_before=True child_after=False" in caplog.text
+    assert "overrun=False" in caplog.text
+    assert "code=API_PROBE_FAILED" in caplog.text
+    assert "ready=False" in caplog.text
+
+
+def test_log_pass_marks_not_started_when_no_duration(caplog):
+    """Una petición no iniciada (duración None) se reporta como not_started."""
+    pytest.importorskip("PySide6")
+    from castlearq_desktop.core import (
+        readiness_qt_transport as readiness_qt_transport)
+    QtReadinessTransport = readiness_qt_transport.QtReadinessTransport
+
+    with patch.object(QtReadinessTransport, "__init__", lambda self, *a, **k: None):
+        mgr = QtReadinessTransport.__new__(QtReadinessTransport)
+        mgr._passes = 1
+        mgr._alive_before = None
+        mgr._pass_results = {
+            HEALTH_PATH: ("ok", 200, None),
+            MODELS_PATH: ("not_started", None, None),
+            ARTIFACTS_PATH: ("transport_error", None, None),
+        }
+        mgr._request_durations = {
+            HEALTH_PATH: 0.010,
+            MODELS_PATH: None,
+            ARTIFACTS_PATH: None,
+        }
+        mgr._deadline = None
+
+        with caplog.at_level(
+            logging.DEBUG,
+            logger="castlearq_desktop.core.readiness_qt_transport",
+        ):
+            mgr._log_pass(
+                now=5.0,
+                alive_after=True,
+                overrun=True,
+                code=ErrorCode.READINESS_TIMEOUT,
+                ready=False,
+            )
+
+    assert "pass=1" in caplog.text
+    assert "path=/health kind=ok status=200 duration_ms=10" in caplog.text
+    assert (
+        "path=/v1/models kind=not_started status=None duration_ms=None"
+        in caplog.text
+    )
+    assert (
+        "path=/v1/artifacts kind=transport_error status=None duration_ms=None"
+        in caplog.text
+    )
+    assert "overrun=True" in caplog.text
+    assert "code=READINESS_TIMEOUT" in caplog.text
+    assert "ready=False" in caplog.text

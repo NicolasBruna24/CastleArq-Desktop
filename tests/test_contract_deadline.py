@@ -27,6 +27,7 @@ from castlearq_desktop.core.contracts import (
     GLOBAL_DEADLINE_SECONDS,
     MAX_REQUEST_TIMEOUT_SECONDS,
     POLL_INTERVAL_SECONDS,
+    READINESS_REQUEST_TIMEOUT_SECONDS,
     TRANSPORT_RETRIES_ENABLED,
     Deadline,
 )
@@ -52,6 +53,19 @@ def test_approved_policy_constants() -> None:
     assert MAX_REQUEST_TIMEOUT_SECONDS == 4.0
     assert POLL_INTERVAL_SECONDS == 0.25
     assert TRANSPORT_RETRIES_ENABLED is False
+
+
+def test_readiness_timeout_is_separate_from_the_generic_maximum() -> None:
+    """Readiness owns its cap; the generic maximum keeps its approved value.
+
+    CastleArq Core 0.6.0 answers ``GET /v1/artifacts`` with HTTP 200 after
+    ~5.5-5.8 s, so the generic 4 s cap made every readiness pass fail with a
+    per-request timeout. The correction raises only the readiness cap and
+    leaves the timeout of every other HTTP client untouched.
+    """
+    assert READINESS_REQUEST_TIMEOUT_SECONDS == 10.0
+    assert READINESS_REQUEST_TIMEOUT_SECONDS > MAX_REQUEST_TIMEOUT_SECONDS
+    assert MAX_REQUEST_TIMEOUT_SECONDS == 4.0
 
 
 def test_initial_budget_is_the_full_global_deadline() -> None:
@@ -139,8 +153,44 @@ def test_custom_max_timeout_is_respected() -> None:
     assert deadline.effective_request_timeout(1.0, max_request_timeout=0.5) == 0.5
 
 
+def test_readiness_cap_still_respects_the_global_budget() -> None:
+    """The larger readiness cap never overrides the remaining global budget.
+
+    ``effective_request_timeout`` returns ``min(cap, remaining)``: with the
+    10 s readiness cap the *global* 20 s deadline remains the binding
+    constraint once less than 10 s of budget is left.
+    """
+    deadline = Deadline.starting_now(now=0.0)
+    # Ample budget: the readiness cap wins.
+    assert deadline.effective_request_timeout(
+        0.0, max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS) == 10.0
+    assert deadline.effective_request_timeout(
+        5.0, max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS) == 10.0
+    # Less budget than the cap: the remaining budget wins.
+    assert deadline.effective_request_timeout(
+        15.0, max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS) == 5.0
+    assert deadline.effective_request_timeout(
+        19.75, max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS
+    ) == pytest.approx(0.25)
+    # Exactly exhausted: no request may start.
+    assert deadline.effective_request_timeout(
+        20.0, max_request_timeout=READINESS_REQUEST_TIMEOUT_SECONDS) == 0.0
+
+
+def test_readiness_cap_never_exceeds_the_global_deadline() -> None:
+    """The readiness cap is smaller than the global deadline on its own.
+
+    This keeps a single request from being able to outlive the whole global
+    budget: the global deadline stays the outermost bound of the flow.
+    """
+    assert READINESS_REQUEST_TIMEOUT_SECONDS < GLOBAL_DEADLINE_SECONDS
+
+
 def test_http_client_default_timeout_is_the_approved_maximum() -> None:
-    """The inert placeholder default must not contradict DEC-E's 4 s cap."""
+    """The inert placeholder default must not contradict DEC-E's 4 s cap.
+
+    The readiness correction must not leak into the generic HTTP boundary.
+    """
     client = CoreHttpClient()
     assert client._timeout == MAX_REQUEST_TIMEOUT_SECONDS == 4.0
 

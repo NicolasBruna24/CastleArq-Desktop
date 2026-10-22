@@ -21,7 +21,7 @@ GUI stays responsive while readiness runs:
 
 * ``QNetworkAccessManager`` issues non-blocking GET requests to the three
   approved endpoints (``/health``, ``/v1/models``, ``/v1/artifacts``).
-* ``QTimer`` drives the per-request timeout (4 s, capped by the global 20 s
+* ``QTimer`` drives the per-request timeout (10 s, capped by the global 20 s
   deadline), the 250 ms polling interval, and the global deadline -- no
   ``time.sleep`` and no synchronous HTTP.
 * Qt signals deliver each pass (``progress``) and the terminal outcome
@@ -37,17 +37,21 @@ detected and classified as ``READINESS_TIMEOUT`` instead of success.
 
 from __future__ import annotations
 
+import logging
 from typing import Any, Callable, FrozenSet, List, Optional, Tuple
 
 from PySide6.QtCore import QObject, QUrl, Signal
 from PySide6.QtNetwork import QNetworkAccessManager, QNetworkReply, QNetworkRequest
 
+#: Logger dedicado al diagnóstico temporal de readiness (solo DEBUG).
+_logger = logging.getLogger(__name__)
+
 from castlearq_desktop.core.contracts import (
     ARTIFACTS_PATH,
     HEALTH_PATH,
-    MAX_REQUEST_TIMEOUT_SECONDS,
     MODELS_PATH,
     POLL_INTERVAL_SECONDS,
+    READINESS_REQUEST_TIMEOUT_SECONDS,
     Deadline,
     ErrorCode,
     ProbeObservation,
@@ -127,6 +131,7 @@ class QtReadinessTransport(QObject):
         installed_version_provider: Optional[Callable[[], Any]] = None,
         version_pending: Optional[Callable[[], bool]] = None,
         supported_versions: FrozenSet[str] = SUPPORTED_CORE_VERSIONS,
+        request_timeout: float = READINESS_REQUEST_TIMEOUT_SECONDS,
     ) -> None:
         super().__init__()
         self.base_url = base_url
@@ -138,10 +143,19 @@ class QtReadinessTransport(QObject):
         self._installed_version_provider = installed_version_provider
         self._version_pending = version_pending
         self._supported_versions = supported_versions
+        #: Per-request cap for readiness probes. Injectable so a test (or a
+        #: future policy revision) can exercise another cap without changing
+        #: the global budget.
+        self._request_timeout = float(request_timeout)
 
         self._finished = False
         self._deadline: Optional[Deadline] = None
         self._passes = 0
+
+        #: Wall-clock start time per in-flight request path (seconds, monotonic).
+        self._request_start_times: dict = {}
+        #: Measured duration per completed request path (seconds, monotonic).
+        self._request_durations: dict = {}
 
         # True while a completed pass is waiting for the installed version.
         self._held = False
@@ -229,8 +243,12 @@ class QtReadinessTransport(QObject):
             self._pass_results[path] = ("not_started", None, None)
             self._check_complete()
             return
-        timeout = self._deadline.effective_request_timeout(now)
+        timeout = self._deadline.effective_request_timeout(
+            now, max_request_timeout=self._request_timeout)
         request = QNetworkRequest(QUrl(self._url(path)))
+        #: Registra el instante de inicio para medir la duración real de la
+        #: solicitud (incluidos los timeouts) sin alterar la petición.
+        self._request_start_times[path] = self._now()
         try:
             reply = self._nam.get(request)
         except Exception:  # pragma: no cover - defensive
@@ -251,6 +269,11 @@ class QtReadinessTransport(QObject):
         if timer is not None:
             self._stop_timer(timer)
         self._active_replies.pop(path, None)
+        #: Mide la duración real de la solicitud (incluidos timeouts) antes de
+        #: descartar el reply; None si la petición no llegó a iniciarse.
+        start = self._request_start_times.pop(path, None)
+        if start is not None:
+            self._request_durations[path] = self._now() - start
         if self._finished:
             self._delete_reply(reply)
             return
@@ -319,6 +342,31 @@ class QtReadinessTransport(QObject):
                 pass
 
 
+    def _log_pass(self, now: float, alive_after: Optional[bool], overrun: bool,
+                  code: Optional[ErrorCode], ready: bool) -> None:
+        """Registra el diagnóstico temporal de una pasada de readiness (solo DEBUG).
+
+        No altera la lógica de readiness, los timeouts, las señales ni el ciclo
+        de vida de Qt; solo lee valores ya disponibles y los emite al logger.
+        """
+        remaining = (
+            self._deadline.remaining(now) if self._deadline is not None else None)
+        parts: List[str] = []
+        for path in READINESS_PROBE_PATHS:
+            kind, status, _body = self._pass_results.get(
+                path, ("not_started", None, None))
+            duration = self._request_durations.get(path)
+            parts.append(
+                f"path={path} kind={kind} status={status} "
+                f"duration_ms={None if duration is None else round(duration * 1000, 1)}")
+        _logger.debug(
+            "READINESS pass=%s %s remaining_s=%s child_before=%s child_after=%s "
+            "overrun=%s code=%s ready=%s",
+            self._passes, " ".join(parts),
+            None if remaining is None else round(remaining, 3),
+            self._to_predicate(self._alive_before), alive_after, overrun,
+            code.value if code is not None else None, ready)
+
     def _check_complete(self) -> None:
         if self._finished or self._active_replies:
             return
@@ -345,9 +393,13 @@ class QtReadinessTransport(QObject):
                   if not _is_success(k, s)]
         code = self._classify(readiness, failed, overrun=overrun)
         ready = readiness.ready and not overrun
+        self._log_pass(now, alive_after, overrun, code, ready)
         self.progress.emit(ReadinessProbeResult(
             ready=ready, outcome=readiness, error_code=code))
         if ready:
+            _logger.debug(
+                "READINESS FINAL pass=%s code=None deadline_expired=False ready=True",
+                self._passes)
             self._finish(ReadinessWaitResult(
                 ready=True, outcome=readiness, passes=self._passes,
                 error_code=None, deadline_expired=False))
@@ -444,16 +496,24 @@ class QtReadinessTransport(QObject):
         # reported as-is (production: NOT_EVALUATED, never ready).
         outcome = evaluate_readiness(ReadinessObservations(
             api_contract=self._api_contract))
-        return ReadinessWaitResult(
+        result = ReadinessWaitResult(
             ready=False, outcome=outcome, passes=self._passes,
             error_code=ErrorCode.READINESS_TIMEOUT, deadline_expired=True)
+        _logger.debug(
+            "READINESS FINAL pass=%s code=READINESS_TIMEOUT deadline_expired=True ready=False",
+            self._passes)
+        return result
 
     def _cancelled_result(self) -> ReadinessWaitResult:
         outcome = evaluate_readiness(ReadinessObservations(
             api_contract=self._api_contract))
-        return ReadinessWaitResult(
+        result = ReadinessWaitResult(
             ready=False, outcome=outcome, passes=self._passes,
             error_code=None, deadline_expired=False)
+        _logger.debug(
+            "READINESS FINAL pass=%s code=None deadline_expired=False ready=False cancelled=True",
+            self._passes)
+        return result
 
     def _finish(self, result: ReadinessWaitResult) -> None:
         if self._finished:
@@ -473,6 +533,8 @@ class QtReadinessTransport(QObject):
                 pass
             self._delete_reply(reply)
         self._active_replies = {}
+        self._request_start_times = {}
+        self._request_durations = {}
         self._stop_timer(self._poll_timer)
         self._poll_timer = None
         self._stop_timer(self._deadline_timer)

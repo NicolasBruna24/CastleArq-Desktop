@@ -17,8 +17,10 @@
 """WP0-C — Monotonic deadline-budget arithmetic (pure).
 
 Implements DEC-E: a 20 s global readiness deadline measured by a monotonic
-clock, a 4 s maximum per-request timeout, a 250 ms polling interval, and an
-effective per-request timeout of ``min(4 s, remaining budget)``.
+clock, a 250 ms polling interval, and an effective per-request timeout of
+``min(cap, remaining budget)``. The generic per-request cap is 4 s
+(:data:`MAX_REQUEST_TIMEOUT_SECONDS`); readiness uses its own, larger cap
+(:data:`READINESS_REQUEST_TIMEOUT_SECONDS`).
 
 This module contains no sleeps, no transport, and no retries. It only performs
 arithmetic over explicitly supplied or injected time values.
@@ -34,6 +36,15 @@ GLOBAL_DEADLINE_SECONDS = 20.0
 
 #: Maximum timeout for any single HTTP request, in seconds (DEC-E).
 MAX_REQUEST_TIMEOUT_SECONDS = 4.0
+
+#: Maximum timeout for a single *readiness* probe request, in seconds.
+#:
+#: Readiness needs a cap of its own: ``GET /v1/artifacts`` on CastleArq Core
+#: 0.6.0 answers HTTP 200 but takes ~5.5-5.8 s, which exceeds the generic
+#: 4 s cap and made every readiness pass fail with a per-request timeout.
+#: The generic :data:`MAX_REQUEST_TIMEOUT_SECONDS` is left untouched so the
+#: timeout of every other HTTP client is unchanged.
+READINESS_REQUEST_TIMEOUT_SECONDS = 10.0
 
 #: Polling interval, in seconds (DEC-E: 250 ms).
 POLL_INTERVAL_SECONDS = 0.25
@@ -115,5 +126,6 @@ __all__ = [
     "GLOBAL_DEADLINE_SECONDS",
     "MAX_REQUEST_TIMEOUT_SECONDS",
     "POLL_INTERVAL_SECONDS",
+    "READINESS_REQUEST_TIMEOUT_SECONDS",
     "TRANSPORT_RETRIES_ENABLED",
 ]
