@@ -219,8 +219,14 @@ class ChatView(QWidget):
 
     def _on_turn_completed(self, response: str, turn_count: int) -> None:
         self._awaiting_turn = False
-        self._append(f"Core ({turn_count}): {response}")
-        self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
+        if response.strip() == "":
+            self._append(f"Core ({turn_count}): (sin contenido)")
+            self._status.setText(
+                f"Respuesta recibida sin contenido ({turn_count} turno(s))."
+            )
+        else:
+            self._append(f"Core ({turn_count}): {response}")
+            self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
 
     def _on_failed(self, message: str) -> None:
         if self._awaiting_turn:
