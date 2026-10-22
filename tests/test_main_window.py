@@ -199,3 +199,30 @@ def test_acquisition_finished_session_active_clears_pending(app):
         service.refresh.assert_called_once()
     finally:
         window.close()
+def test_acquisition_failed_clears_pending_and_invalidates_service(app):
+    window = _window(app)
+    try:
+        library = MagicMock()
+        service = MagicMock()
+        window._local_library = library
+        window._local_library_service = service
+
+        window._on_acquisition_failed("boom")
+
+        library.clear_pending_selection.assert_called_once()
+        service.invalidate.assert_called_once()
+    finally:
+        window.close()
+
+
+def test_acquisition_failed_without_dependencies_does_not_raise(app):
+    window = _window(app)
+    try:
+        window._local_library = None
+        window._local_library_service = None
+
+        window._on_acquisition_failed("boom")
+
+        # No dependencies were present, so nothing should be invoked.
+    finally:
+        window.close()
