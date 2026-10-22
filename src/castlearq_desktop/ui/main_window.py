@@ -104,6 +104,8 @@ class MainWindow(QMainWindow):
         #: started because another library query was already running.
         self._pending_library_refresh: bool = False
 
+        # All sections live in one scrollable column so the lower sections
+        # (local library, chat) stay reachable in a 900x600 window.
         scroll = QScrollArea(self)
         scroll.setWidgetResizable(True)
 

@@ -72,7 +72,6 @@ def shutdown_exit_code(state: object) -> int:
     return 1 if state is LifecycleState.SHUTDOWN_FAILED else 0
 
 
-
 #: Loggers whose DEBUG messages are enabled only when opt-in readiness
 #: debugging is requested through the environment variable.
 _READINESS_LOGGERS = (
@@ -207,6 +206,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     """
     if os.environ.get("CASTLEARQ_READINESS_DEBUG") == "1":
         _configure_readiness_debug_logging()
+
     app = create_application(argv)
 
     settings = create_interpreter_settings()
@@ -214,7 +214,7 @@ def main(argv: Optional[List[str]] = None) -> int:
     # DEC-A (conservative admission): the static input stays NOT_EVALUATED
     # (fail-closed); per-pass dynamics engage through the coordinator's
     # installed-version provider, and production READY requires a matched
-    # version that is explicitly allowlisted — currently only 0.5.1 (see
+    # version that is explicitly allowlisted — currently 0.5.1 (see
     # core/version_admission.py).
     #
     # The installed-version probe is a bounded blocking subprocess (5 s), so
