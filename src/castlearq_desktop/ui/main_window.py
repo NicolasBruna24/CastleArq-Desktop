@@ -389,19 +389,24 @@ class MainWindow(QMainWindow):
         else:
             library.clear_pending_selection()
         self._schedule_library_refresh(service)
+
+    def _schedule_library_refresh(self, service) -> None:
+        """Start a library refresh if possible; remember one pending request.
+
+        If a query is already running, remember the request and consume it
+        once that query finishes (via ``_on_local_library_finished``).
+        Avoids duplicates and never loses a scheduled refresh.
+        """
+        if self._pending_library_refresh:
+            return
         if service.is_busy:
             self._pending_library_refresh = True
             return
         if service.refresh():
             return
-        # The refresh did not start (shutting down): the pending
-        # request stays for the query in course; invalidate() clears it.
+        # The refresh did not start (shutting down): the pending request
+        # stays for the query in course; invalidate() clears it.
         return
-
-    def _schedule_library_refresh(self, service) -> None:
-        """Start a library refresh if possible; remember one pending request."""
-        if self._pending_library_refresh:
-            return
 
     def _on_local_library_finished(self, artifacts, store=None) -> None:
         """Show Core's complete artifact list in the explorer's detail.
