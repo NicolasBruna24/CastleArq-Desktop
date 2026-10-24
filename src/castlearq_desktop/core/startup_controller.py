@@ -109,6 +109,7 @@ class StartupController(QObject):
         self._shutting_down = False
         self._shutdown_terminal = False
         self._last_state: Optional[LifecycleState] = None
+        self._external: bool = False
 
         self._tick_timer: Optional[Any] = None
         self._shutdown_deadline_timer: Optional[Any] = None
@@ -128,16 +129,45 @@ class StartupController(QObject):
         if self._starting or self._shutting_down:
             return None
         self._starting = True
-        result = self._coordinator.launch()
-        manager = self._coordinator.manager
-        self._emit_state(manager.state if manager is not None else None)
-        if getattr(result, "status", None) in ("ok", "pending"):
-            self._begin_readiness()
-            self._start_tick()
-        else:
-            # Definite launch failure: no readiness, no observation to start.
+
+        # External Core admission check before spawning a managed process.
+        try:
+            admission = self._coordinator.connect_existing()
+        except Exception:  # noqa: BLE001
+            admission = None
+        status_value = getattr(getattr(admission, "status", None), "value", None)
+        if status_value == "admitted":
+            self._external = True
+            manager = self._coordinator.manager
+            if manager is None:
+                self._coordinator._ensure_manager()
+                manager = self._coordinator.manager
+            self._emit_state(manager.state if manager is not None else None)
             self._starting = False
-        return result
+            from castlearq_desktop.core.lifecycle_manager import OperationResult
+            return OperationResult(status="ok", state=manager.state if manager is not None else None)
+        # Only an unequivocal connection refused permits a managed launch.
+        if status_value == "connection_refused":
+            self._external = False
+            result = self._coordinator.launch()
+            manager = self._coordinator.manager
+            self._emit_state(manager.state if manager is not None else None)
+            if getattr(result, "status", None) in ("ok", "pending"):
+                self._begin_readiness()
+                self._start_tick()
+            else:
+                self._starting = False
+            return result
+        # Everything else (None, exception, timeout, http_error, incompatible,
+        # missing/malformed version, ambiguous, unknown) -> explicit failure,
+        # never launch.
+        self._external = False
+        self._starting = False
+        from castlearq_desktop.core.lifecycle_manager import OperationResult
+        return OperationResult(status="failed",
+                              state=(self._coordinator.manager.state
+                                     if self._coordinator.manager is not None else None),
+                              error=getattr(admission, "code", None) if admission is not None else None)
 
     def _begin_readiness(self) -> None:
         # Defensive: never keep more than one live checker.
@@ -229,6 +259,11 @@ class StartupController(QObject):
         self._coordinator.invalidate_version_probe()
 
         manager = self._coordinator.manager
+        if self._external:
+            # External Core: never terminate; just finalize.
+            self._external = False
+            self._finalize_shutdown(LifecycleState.STOPPED)
+            return
         if manager is None:
             # No Core was ever started: nothing to shut down.
             self._finalize_shutdown(LifecycleState.STOPPED)

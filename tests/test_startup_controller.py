@@ -612,3 +612,19 @@ def test_selecting_a_model_does_not_overwrite_the_core_status(qt_app):
         assert window._model_status_label.text() == "Ningún modelo seleccionado."
     finally:
         window.close()
+def test_external_core_shutdown_does_not_terminate_or_kill(qt_app):
+    """An admitted external Core must be closed without terminate/kill calls."""
+    b = build(FakePopen())
+    b.coordinator._ensure_manager()
+    b.controller._external = True
+    manager = b.coordinator.manager
+    assert manager is not None
+    terminate_calls = []
+    kill_calls = []
+    manager._terminate_process = lambda *a, **k: terminate_calls.append((a, k))
+    if hasattr(manager, "_kill_process"):
+        manager._kill_process = lambda *a, **k: kill_calls.append((a, k))
+    b.controller.request_shutdown()
+    assert terminate_calls == []
+    assert kill_calls == []
+    assert b.controller._external is False
