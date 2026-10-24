@@ -211,5 +211,5 @@ def test_controller_neutrality(app):
     ctl, pool = _ctl(discover=lambda **k: _res(S.LATEST_INSTALLED))
     ctl.check()
     pool.drain()
-    assert va_mod.SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0"})
+    assert va_mod.SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0", "0.6.1"})
     assert frozenset(errors_mod.ErrorCode) == before

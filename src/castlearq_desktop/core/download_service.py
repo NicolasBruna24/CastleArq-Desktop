@@ -517,6 +517,7 @@ class _DownloadRunnable(QRunnable):
         request: Request,
         popen_factory: Callable[..., Any],
         interpreter: str,
+        core_working_directory: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._bridge = bridge
@@ -524,6 +525,8 @@ class _DownloadRunnable(QRunnable):
         self._request = request
         self._popen_factory = popen_factory
         self._interpreter = interpreter
+        self._core_working_directory = core_working_directory
+
         self.setAutoDelete(True)
 
     def run(self) -> None:
@@ -867,12 +870,14 @@ class LocalLibraryService(QObject):
         self,
         interpreter_settings: InterpreterSettingsStore,
         *,
+        core_working_directory: Optional[str] = None,
         popen_factory: Optional[Any] = None,
         thread_pool_factory: Optional[Any] = None,
         parent: Optional[QObject] = None,
     ) -> None:
         super().__init__(parent)
         self._interpreter_settings = interpreter_settings
+        self._core_working_directory = core_working_directory
         self._popen_factory = (
             popen_factory if popen_factory is not None else subprocess.Popen
         )
@@ -924,6 +929,7 @@ class LocalLibraryService(QObject):
             self._generation,
             self._popen_factory,
             python,
+            core_working_directory=self._core_working_directory,
         )
         bridge.started.connect(self._on_worker_started)
         bridge.resolved.connect(self._on_resolved)
@@ -1002,12 +1008,14 @@ class _LibraryRunnable(QRunnable):
         generation: int,
         popen_factory: Callable[..., Any],
         interpreter: str,
+        core_working_directory: Optional[str] = None,
     ) -> None:
         super().__init__()
         self._bridge = bridge
         self._generation = generation
         self._popen_factory = popen_factory
         self._interpreter = interpreter
+        self._core_working_directory = core_working_directory
         self.setAutoDelete(True)
 
     def run(self) -> None:
@@ -1056,6 +1064,17 @@ class _LibraryRunnable(QRunnable):
         return artifacts, None
 
     def _run(self, argv: list[str]) -> tuple[str, str, int]:
+        # Determine the working directory: use configured core_working_directory
+        # if set and valid, otherwise fall back to None (inherited CWD).
+        cwd: Optional[str] = None
+        if self._core_working_directory is not None:
+            if os.path.isdir(self._core_working_directory):
+                cwd = self._core_working_directory
+            else:
+                raise RuntimeError(
+                    f"El directorio de trabajo de Core no existe o no es un directorio: "
+                    f"{self._core_working_directory}"
+                )
         try:
             process = self._popen_factory(
                 argv,
@@ -1064,6 +1083,7 @@ class _LibraryRunnable(QRunnable):
                 stdout=subprocess.PIPE,
                 stderr=subprocess.PIPE,
                 text=True,
+                cwd=cwd,
             )
         except (FileNotFoundError, PermissionError, OSError) as exc:
             raise RuntimeError(f"no se pudo iniciar Core: {exc}") from exc

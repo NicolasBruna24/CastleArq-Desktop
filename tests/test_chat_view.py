@@ -447,3 +447,240 @@ def test_a_completed_turn_clears_pending_state(view) -> None:
 
     assert widget._history.toPlainText() == history_before
     assert "fallo tardío" not in widget._history.toPlainText()
+
+
+def test_history_mode_disables_send_and_back_restores(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._history.append("user: hola")
+
+    class FakeStore:
+        def list_conversations(self):
+            return [{"id": "cid", "model_id": "m", "artifact_filename": "a", "message_count": 1}]
+
+        def load_conversation(self, cid):
+            return [{"role": "assistant", "content": "historico"}]
+
+    widget._store = FakeStore()
+
+    import castlearq_desktop.ui.chat_view as cv
+    monkeypatch.setattr(cv.QDialog, "exec", lambda self: 1)
+
+    class Item:
+        def data(self, n):
+            return "cid"
+
+    monkeypatch.setattr(cv.QListWidget, "currentItem", lambda self: Item())
+
+    widget._on_history()
+    assert widget._send_button.isEnabled() is False
+    assert "historico" in widget._history.toPlainText()
+
+    widget._on_back_from_history()
+    assert "hola" in widget._history.toPlainText()
+    assert widget._send_button.isEnabled() is True
+
+
+def _patch_dialog(monkeypatch, summary_text, accept=True):
+    from PySide6.QtWidgets import QDialog, QTextEdit
+    monkeypatch.setattr(QDialog, "exec", lambda self: 1 if accept else 0)
+    monkeypatch.setattr(QTextEdit, "toPlainText", lambda self: summary_text)
+
+
+def test_continuation_summary_sent_in_one_turn(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+
+    _patch_dialog(monkeypatch, "resumen")
+    widget._on_create_continuation()
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+    assert len(service.turns) == 1
+    assert "Contexto proporcionado por el usuario:" in service.turns[0]
+    assert "Mensaje actual:" in service.turns[0]
+    assert "resumen" in service.turns[0]
+    assert "hola" in service.turns[0]
+
+
+def test_continuation_empty_summary_sends_only_message(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+
+    _patch_dialog(monkeypatch, "")
+    widget._on_create_continuation()
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+    assert service.turns[-1] == "hola"
+
+
+def test_continuation_spaces_summary_sends_only_message(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+
+    _patch_dialog(monkeypatch, "   ")
+    widget._on_create_continuation()
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+    assert service.turns[-1] == "hola"
+
+
+def test_continuation_cancel_does_not_open_session(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+    opened_before = len(service.opened)
+
+    from PySide6.QtWidgets import QDialog
+    monkeypatch.setattr(QDialog, "exec", lambda self: 0)
+    widget._on_create_continuation()
+    assert len(service.opened) == opened_before
+
+
+def test_continuation_active_session_blocks(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+    opened_before = len(service.opened)
+    widget._on_create_continuation()
+    assert len(service.opened) == opened_before
+    assert widget._session_id == "session-1"
+
+
+def test_continuation_open_failure(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+    service.refuse_open = True
+
+    from PySide6.QtWidgets import QDialog, QTextEdit
+    monkeypatch.setattr(QDialog, "exec", lambda self: 1)
+    monkeypatch.setattr(QTextEdit, "toPlainText", lambda self: "resumen")
+
+    widget._on_create_continuation()
+    assert widget._session_id is None
+    assert "No se pudo abrir" in widget._status.text()
+
+
+def test_continuation_first_turn_failure(view, monkeypatch) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._session_id = None
+    widget._history_mode = True
+    widget._saved_history = ""
+    widget._saved_status = "ok"
+    widget._continue_button.setEnabled(True)
+
+    from PySide6.QtWidgets import QDialog, QTextEdit
+    monkeypatch.setattr(QDialog, "exec", lambda self: 1)
+    monkeypatch.setattr(QTextEdit, "toPlainText", lambda self: "resumen")
+    widget._on_create_continuation()
+    service.refuse_send = True
+    widget._prompt.setPlainText("hola")
+    widget._on_send()
+    assert "no fue aceptado" in widget._status.text().lower() or "no fue aceptado" in widget._status.text()
+
+def test_delete_history_non_active_success(view) -> None:
+    widget, service = view
+    store = type('S', (), {})()
+    store.delete_conversation = lambda cid: True
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    assert widget._delete_history('other-id') == ('deleted', None)
+    assert service.closed_sessions == 0
+
+def test_delete_history_active_blocks(view) -> None:
+    widget, service = view
+    calls = []
+    store = type('S', (), {})()
+    store.delete_conversation = lambda cid: calls.append(cid) or True
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    assert widget._delete_history('active-id') == ('active', None)
+    assert calls == []
+
+def test_delete_history_not_found(view) -> None:
+    widget, _ = view
+    store = type('S', (), {})()
+    store.delete_conversation = lambda cid: False
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    assert widget._delete_history('other-id') == ('not_found', None)
+
+def test_delete_history_error(view) -> None:
+    from castlearq_desktop.storage.conversation_store import ConversationStoreError
+    widget, _ = view
+    store = type('S', (), {})()
+    def boom(cid):
+        raise ConversationStoreError('boom')
+    store.delete_conversation = boom
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    assert widget._delete_history('other-id') == ('error', 'boom')
+
+def test_delete_history_passes_uuid(view) -> None:
+    widget, _ = view
+    seen = []
+    store = type('S', (), {})()
+    store.delete_conversation = lambda cid: (seen.append(cid) or True)
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    widget._delete_history('exact-uuid')
+    assert seen == ['exact-uuid']
+
+def test_delete_history_session_preserved(view) -> None:
+    widget, service = view
+    store = type('S', (), {})()
+    store.delete_conversation = lambda cid: True
+    widget._store = store
+    widget._conversation_id = 'active-id'
+    widget._session_id = 'session-1'
+    widget._delete_history('other-id')
+    assert widget._session_id == 'session-1'
+def test_rename_identity_preserved(view) -> None:
+    widget, _ = view
+    widget._conversation_id = 'active-id'
+    widget._session_id = 'session-1'
+    assert widget._conversation_id == 'active-id'
+    assert widget._session_id == 'session-1'

@@ -32,9 +32,12 @@ from PySide6.QtWidgets import (
     QFileDialog,
     QGroupBox,
     QLabel,
+    QListWidget,
     QMainWindow,
     QPushButton,
     QScrollArea,
+    QSplitter,
+    QStackedWidget,
     QVBoxLayout,
     QWidget,
 )
@@ -95,6 +98,8 @@ class MainWindow(QMainWindow):
         # Core startup/readiness/shutdown orchestration to it instead of owning
         # any process or HTTP concern directly.
         self._controller = controller
+        self._runtime_readiness_result = None
+        self._runtime_readiness_error = None
 
         # Selected catalog model and selected installed artifact are kept
         # apart: they come from two different surfaces of Core.
@@ -103,16 +108,27 @@ class MainWindow(QMainWindow):
         #: Library refresh scheduled by a finished acquisition but not yet
         #: started because another library query was already running.
         self._pending_library_refresh: bool = False
+        self._runtime_lifecycle_label = None
 
-        # All sections live in one scrollable column so the lower sections
-        # (local library, chat) stay reachable in a 900x600 window.
-        scroll = QScrollArea(self)
-        scroll.setWidgetResizable(True)
+        # Navigation shell: sidebar + stacked pages.
+        self._sidebar = QListWidget(self)
+        self._sidebar.addItems([
+            "Inicio",
+            "Modelos",
+            "Biblioteca local",
+            "Chat",
+            "Runtime y diagnóstico",
+            "Intel / OpenVINO",
+            "Configuración",
+        ])
 
-        central = QWidget(scroll)
-        layout = QVBoxLayout(central)
-        layout.setContentsMargins(24, 24, 24, 24)
-        layout.setSpacing(12)
+        self._stacked = QStackedWidget(self)
+
+        # Home page keeps the original interpreter/runtime controls.
+        home_page = QWidget(self)
+        home_layout = QVBoxLayout(home_page)
+        home_layout.setContentsMargins(24, 24, 24, 24)
+        home_layout.setSpacing(12)
 
         title = QLabel(APP_NAME)
         title_font = title.font()
@@ -130,19 +146,14 @@ class MainWindow(QMainWindow):
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
 
-        layout.addWidget(title)
-        layout.addWidget(self._interpreter_button)
-        layout.addWidget(self._interpreter_label)
+        home_layout.addWidget(title)
+        home_layout.addWidget(self._interpreter_button)
+        home_layout.addWidget(self._interpreter_label)
 
         self._status_label = QLabel(_STATUS_IDLE_TEXT)
         self._status_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
-        # Selection feedback lives in its own labels: the Core status line
-        # reports Core's own state and must not be overwritten by a UI
-        # selection. The catalog selection and the installed-artifact
-        # selection are kept apart, because they come from two different
-        # surfaces of Core and neither replaces the other.
         self._model_status_label = QLabel(_NO_MODEL_TEXT)
         self._model_status_label.setWordWrap(True)
         self._model_status_label.setTextInteractionFlags(
@@ -155,129 +166,46 @@ class MainWindow(QMainWindow):
         )
         self._start_button = QPushButton("Start Core")
         self._start_button.clicked.connect(self._on_start)
-        layout.addWidget(self._start_button)
-        layout.addWidget(self._status_label)
-        layout.addWidget(self._model_status_label)
-        layout.addWidget(self._artifact_status_label)
+        home_layout.addWidget(self._start_button)
+        home_layout.addWidget(self._status_label)
+        home_layout.addWidget(self._model_status_label)
+        home_layout.addWidget(self._artifact_status_label)
+        home_layout.addStretch(1)
 
-        # Settings → Updates (Stage 3): minimal section, no navigation change.
-        settings_box = QGroupBox("Settings", self)
-        settings_layout = QVBoxLayout(settings_box)
-        updates_title = QLabel("Actualizaciones")
-        updates_title.setTextInteractionFlags(
-            Qt.TextInteractionFlag.TextSelectableByMouse
-        )
-        settings_layout.addWidget(updates_title)
-        try:
-            from castlearq_desktop.core.update_check_controller import (
-                UpdateCheckController,
-            )
-            from castlearq_desktop.ui.updates_section import UpdatesSection
-        except ImportError:  # Updates section is optional
-            self._update_controller = None
-            self._updates_section = QLabel("Updates unavailable.")
-        else:
-            self._update_controller = UpdateCheckController(
-                interpreter_settings=self._interpreter_settings,
-                parent=self,
-            )
-            self._updates_section = UpdatesSection(
-                controller=self._update_controller, parent=settings_box
-            )
-        settings_layout.addWidget(self._updates_section)
-        layout.addWidget(settings_box)
+        self._stacked.addWidget(home_page)
+        self._stacked.addWidget(self._build_models_page())
+        self._stacked.addWidget(self._build_library_page())
+        self._stacked.addWidget(self._build_chat_page())
+        self._stacked.addWidget(self._build_runtime_page())
+        self._stacked.addWidget(self._build_openvino_page())
+        self._stacked.addWidget(self._build_settings_page())
 
-        # Model Explorer: consults GET /v1/models when Core is READY.
-        try:
-            from castlearq_desktop.core.catalog_controller import (
-                CatalogController,
-            )
-            from castlearq_desktop.ui.model_explorer_view import (
-                ModelExplorerView,
-            )
-        except ImportError:  # Model Explorer is optional
-            self._catalog_controller = None
-            self._model_explorer = QLabel("Model Explorer unavailable.")
-            layout.addWidget(self._model_explorer)
-        else:
-            self._catalog_controller = CatalogController(
-                is_ready=self._core_is_ready,
-                parent=self,
-            )
-            self._model_explorer = ModelExplorerView(
-                controller=self._catalog_controller, parent=self
-            )
-            self._model_explorer.set_downloader(
-                ModelAcquisitionService(
-                    interpreter_settings=self._interpreter_settings
-                )
-            )
-            layout.addWidget(self._model_explorer)
-            self._model_explorer.model_selected.connect(self._on_model_selected)
-            self._model_explorer.model_unselected.connect(self._on_model_unselected)
-            self._model_explorer.acquisition_finished.connect(
-                self._on_acquisition_finished
-            )
-            self._model_explorer.acquisition_failed.connect(
-                self._on_acquisition_failed
-            )
+        splitter = QSplitter(self)
+        splitter.addWidget(self._sidebar)
+        splitter.addWidget(self._stacked)
+        self.setCentralWidget(splitter)
 
-        # Local library: the artifacts Core really finds in the model store.
-        # Its state is independent from Core's status line, from the catalog
-        # and from the acquisition.
-        try:
-            from castlearq_desktop.ui.local_library_view import LocalLibraryView
-        except ImportError:  # Local library is optional
-            self._local_library = QLabel("Local library unavailable.")
-            layout.addWidget(self._local_library)
-        else:
-            self._local_library_service = LocalLibraryService(
-                interpreter_settings=self._interpreter_settings
-            )
-            self._local_library = LocalLibraryView(
-                service=self._local_library_service, parent=self
-            )
-            layout.addWidget(self._local_library)
-            self._local_library.artifact_selected.connect(
-                self._on_artifact_selected
-            )
-            self._local_library.artifact_unselected.connect(
-                self._on_artifact_unselected
-            )
-            # A *correct* library query feeds the explorer's local
-            # availability section with the complete artifact list. No
-            # query is ever started for this, and before the first query
-            # there is nothing to send: the explorer claims nothing.
-            self._local_library_service.finished.connect(
-                self._on_local_library_finished
-            )
+        self._sidebar.currentRowChanged.connect(self._stacked.setCurrentIndex)
+        self._sidebar.setCurrentRow(0)
+        self._connect_controller()
 
-        # Chat: a real session on Core's HTTP API. The session owns the
-        # conversation; Desktop only shows what Core answered.
+    def _build_chat_page(self) -> QWidget:
+        """Build the chat section as a standalone page container."""
         try:
             from castlearq_desktop.core.chat_service import ChatService
             from castlearq_desktop.ui.chat_view import ChatView
         except ImportError:  # Chat is optional
             self._chat_view = QLabel("Chat unavailable.")
-            layout.addWidget(self._chat_view)
+            return self._chat_view
         else:
             self._chat_service = ChatService(parent=self)
             self._chat_view = ChatView(service=self._chat_service, parent=self)
-            layout.addWidget(self._chat_view)
             self._chat_view.session_closed.connect(self._on_chat_session_closed)
-            # The library re-checks this state right before applying a
-            # pending selection: a session can open while the query runs.
             if hasattr(self._local_library, "set_session_active_provider"):
                 self._local_library.set_session_active_provider(
                     lambda: bool(getattr(self._chat_view, "has_session", False))
                 )
-
-        layout.addStretch(1)
-
-        scroll.setWidget(central)
-
-        self.setCentralWidget(scroll)
-        self._connect_controller()
+            return self._chat_view
 
     def _on_select_interpreter(self) -> None:
         """Persist an explicitly chosen interpreter path; cancel is a no-op.
@@ -503,6 +431,150 @@ class MainWindow(QMainWindow):
 
     def _on_readiness_error(self, exc: object) -> None:
         self._status_label.setText(f"Core: readiness error ({exc}).")
+
+    def _build_settings_page(self) -> QWidget:
+        """Build the settings/updates section as a standalone page container."""
+        settings_box = QGroupBox("Settings", self)
+        settings_layout = QVBoxLayout(settings_box)
+        updates_title = QLabel("Actualizaciones")
+        updates_title.setTextInteractionFlags(
+            Qt.TextInteractionFlag.TextSelectableByMouse
+        )
+        settings_layout.addWidget(updates_title)
+        try:
+            from castlearq_desktop.core.update_check_controller import (
+                UpdateCheckController,
+            )
+            from castlearq_desktop.ui.updates_section import UpdatesSection
+        except ImportError:  # Updates section is optional
+            self._update_controller = None
+            self._updates_section = QLabel("Updates unavailable.")
+        else:
+            self._update_controller = UpdateCheckController(
+                interpreter_settings=self._interpreter_settings,
+                parent=self,
+            )
+            self._updates_section = UpdatesSection(
+                controller=self._update_controller, parent=settings_box
+            )
+        settings_layout.addWidget(self._updates_section)
+        return settings_box
+
+    def _build_models_page(self) -> QWidget:
+        """Build the model explorer section as a standalone page container."""
+        try:
+            from castlearq_desktop.core.catalog_controller import (
+                CatalogController,
+            )
+            from castlearq_desktop.ui.model_explorer_view import (
+                ModelExplorerView,
+            )
+        except ImportError:  # Model Explorer is optional
+            self._catalog_controller = None
+            self._model_explorer = QLabel("Model Explorer unavailable.")
+            return self._model_explorer
+        else:
+            self._catalog_controller = CatalogController(
+                is_ready=self._core_is_ready,
+                parent=self,
+            )
+            self._model_explorer = ModelExplorerView(
+                controller=self._catalog_controller, parent=self
+            )
+            self._model_explorer.set_downloader(
+                ModelAcquisitionService(
+                    interpreter_settings=self._interpreter_settings
+                )
+            )
+            self._model_explorer.model_selected.connect(self._on_model_selected)
+            self._model_explorer.model_unselected.connect(self._on_model_unselected)
+            self._model_explorer.acquisition_finished.connect(
+                self._on_acquisition_finished
+            )
+            self._model_explorer.acquisition_failed.connect(
+                self._on_acquisition_failed
+            )
+            return self._model_explorer
+
+    def _build_library_page(self) -> QWidget:
+        """Build the local library section as a standalone page container."""
+        try:
+            from castlearq_desktop.ui.local_library_view import LocalLibraryView
+        except ImportError:  # Local library is optional
+            self._local_library = QLabel("Local library unavailable.")
+            return self._local_library
+        else:
+            self._local_library_service = LocalLibraryService(
+                interpreter_settings=self._interpreter_settings
+            )
+            self._local_library = LocalLibraryView(
+                service=self._local_library_service, parent=self
+            )
+            self._local_library.artifact_selected.connect(
+                self._on_artifact_selected
+            )
+            self._local_library.artifact_unselected.connect(
+                self._on_artifact_unselected
+            )
+            self._local_library_service.finished.connect(
+                self._on_local_library_finished
+            )
+            return self._local_library
+
+    def _build_runtime_page(self) -> QWidget:
+        page = QWidget(self)
+        layout = QVBoxLayout(page)
+        layout.setContentsMargins(24, 24, 24, 24)
+        layout.addWidget(QLabel("Runtime y diagnóstico"))
+        self._runtime_lifecycle_label = QLabel("sin información registrada")
+        self._runtime_shutdown_label = QLabel("sin información registrada")
+        self._runtime_pid_label = QLabel("sin información registrada")
+        self._runtime_exit_code_label = QLabel("sin información registrada")
+        self._runtime_shutdown_complete_label = QLabel("sin información registrada")
+        self._runtime_readiness_label = QLabel("sin información registrada")
+        self._runtime_readiness_error_label = QLabel("sin información registrada")
+        for lbl in (self._runtime_lifecycle_label, self._runtime_shutdown_label, self._runtime_pid_label, self._runtime_exit_code_label, self._runtime_shutdown_complete_label, self._runtime_readiness_label, self._runtime_readiness_error_label):
+            layout.addWidget(lbl)
+        return page
+
+    def _update_runtime_view(self) -> None:
+        ctrl = getattr(self, "_controller", None)
+        lc = getattr(ctrl, "lifecycle_state", None) if ctrl is not None else None
+        self._runtime_lifecycle_label.setText(str(lc) if lc is not None else "sin información registrada")
+        sd = getattr(ctrl, "shutdown_state", None) if ctrl is not None else None
+        self._runtime_shutdown_label.setText(str(sd) if sd is not None else "sin información registrada")
+        pid = getattr(ctrl, "pid", None) if ctrl is not None else None
+        self._runtime_pid_label.setText(str(pid) if pid is not None else "sin información registrada")
+        ec = getattr(ctrl, "exit_code", None) if ctrl is not None else None
+        self._runtime_exit_code_label.setText(str(ec) if ec is not None else "sin información registrada")
+        sc = getattr(ctrl, "shutdown_complete", None) if ctrl is not None else None
+        if sc is True:
+            self._runtime_shutdown_complete_label.setText("Shutdown completo: sí.")
+        elif sc is False:
+            self._runtime_shutdown_complete_label.setText("Shutdown completo: no completado.")
+        else:
+            self._runtime_shutdown_complete_label.setText("sin información registrada")
+        res = getattr(self, "_runtime_readiness_result", None)
+        if res is not None:
+            ready = getattr(res, "ready", None)
+            self._runtime_readiness_label.setText("listo" if ready else "no listo")
+        else:
+            self._runtime_readiness_label.setText("sin información registrada")
+        err = getattr(self, "_runtime_readiness_error", None)
+        if err is not None:
+            self._runtime_readiness_error_label.setText("Último error de readiness: " + str(err))
+        else:
+            self._runtime_readiness_error_label.setText("sin información registrada")
+
+    def _build_openvino_page(self) -> QWidget:
+        # OpenVINO requires a Core client; until one is wired, keep a
+        # non-blocking placeholder instead of crashing window construction.
+        self._openvino_service = None
+        self._openvino_view = QLabel("Intel / OpenVINO disponible cuando Core esté listo.")
+        return self._openvino_view
+
+    def _on_sidebar_page_changed(self, index: int) -> None:
+        return None
 
     def closeEvent(self, event: object) -> None:
         """Route window close through the controller; defer while shutting down.

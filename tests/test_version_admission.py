@@ -56,8 +56,8 @@ def script_transport(health, *, models=200, artifacts=200):
 
 
 def test_supported_list_admits_candidate():
-    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0"})
-    assert CANDIDATE_VERSION == "0.6.0"
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0", "0.6.1"})
+    assert CANDIDATE_VERSION == "0.6.1"
     assert CANDIDATE_VERSION in SUPPORTED_CORE_VERSIONS
 
 def test_strict_version_syntax():

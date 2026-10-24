@@ -115,6 +115,7 @@ class LocalLibraryView(QWidget):
 
     artifact_selected = Signal(object)  # LocalArtifact
     artifact_unselected = Signal()
+    open_chat_requested = Signal(object)  # LocalArtifact
 
     def __init__(
         self,
@@ -168,6 +169,11 @@ class LocalLibraryView(QWidget):
         self._button = QPushButton(_REFRESH_TEXT, box)
         self._button.clicked.connect(self._on_refresh)
         layout.addWidget(self._button)
+
+        self._open_chat_button = QPushButton("Abrir chat", box)
+        self._open_chat_button.setEnabled(False)
+        self._open_chat_button.clicked.connect(self._on_open_chat)
+        layout.addWidget(self._open_chat_button)
 
         self._service.started.connect(self._on_started)
         self._service.finished.connect(self._on_finished)
@@ -277,6 +283,12 @@ class LocalLibraryView(QWidget):
 
     # -- selection ----------------------------------------------------------
 
+    def _on_open_chat(self) -> None:
+        if self._selected is None:
+            return
+        self.open_chat_requested.emit(self._selected)
+
+
     def _on_current_changed(
         self, current: Optional[QListWidgetItem], _previous: Any
     ) -> None:
@@ -289,10 +301,12 @@ class LocalLibraryView(QWidget):
         if not isinstance(artifact, LocalArtifact):
             self._selected = None
             self._detail.setText("")
+            self._open_chat_button.setEnabled(False)
             self.artifact_unselected.emit()
             return
         self._selected = artifact
         self._detail.setText("\n".join(self._detail_lines(artifact)))
+        self._open_chat_button.setEnabled(True)
         self.artifact_selected.emit(artifact)
 
     def _detail_lines(self, artifact: LocalArtifact) -> list[str]:

@@ -36,7 +36,7 @@ import pytest
 
 from castlearq_desktop import APP_NAME, ORGANIZATION_DOMAIN, ORGANIZATION_NAME
 from castlearq_desktop.core import CoreHttpClient, CoreProcessManager, HttpClientError
-from castlearq_desktop.storage import ConversationStore
+from castlearq_desktop.storage.conversation_store import ConversationStore, ConversationStoreError
 
 EXPECTED_NON_GUI_MODULES = [
     "castlearq_desktop",
@@ -102,10 +102,9 @@ def test_conversation_store_boundary_persists_nothing() -> None:
     """The storage boundary must not read or write conversations."""
     store = ConversationStore(database_path="/nonexistent/dir/db.sqlite3")
     assert store.database_path == "/nonexistent/dir/db.sqlite3"
-    with pytest.raises(NotImplementedError):
+    with pytest.raises(ConversationStoreError):
         store.save_conversation("conv-1", [])
-    with pytest.raises(NotImplementedError):
-        store.load_conversation("conv-1")
+    assert store.load_conversation("conv-1") == []
 
 
 def test_gui_shell_constructs_headless() -> None:

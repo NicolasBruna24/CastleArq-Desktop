@@ -28,10 +28,14 @@ the session was closed or replaced.
 from __future__ import annotations
 
 from typing import Optional
+import uuid
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QDialog,
     QGroupBox,
+    QListWidget,
+    QListWidgetItem,
     QHBoxLayout,
     QLabel,
     QPlainTextEdit,
@@ -42,6 +46,7 @@ from PySide6.QtWidgets import (
 )
 
 from castlearq_desktop.core.chat_service import ChatService
+from castlearq_desktop.storage.conversation_store import ConversationStore, ConversationStoreError
 from castlearq_desktop.core.download_service import LocalArtifact
 
 __all__ = ["ChatView"]
@@ -59,16 +64,25 @@ class ChatView(QWidget):
     """Section that starts a Core chat session and shows its turns."""
 
     session_closed = Signal()
+    change_model_requested = Signal()
 
     def __init__(
         self,
         service: ChatService,
+        store: Optional[ConversationStore] = None,
         parent: Optional[QWidget] = None,
     ) -> None:
         super().__init__(parent)
         self._service = service
+        self._store = store
         self._artifact: Optional[LocalArtifact] = None
         self._session_id: Optional[str] = None
+        self._conversation_id: Optional[str] = None
+        self._messages: list[dict] = []
+        self._history_mode: bool = False
+        self._saved_history: str = ""
+        self._saved_status: str = ""
+        self._pending_summary: Optional[str] = None
         self._awaiting_turn: bool = False
         self._last_prompt: Optional[str] = None
 
@@ -95,6 +109,17 @@ class ChatView(QWidget):
         self._start_button = QPushButton(_START_TEXT, box)
         self._start_button.clicked.connect(self._on_start)
         buttons.addWidget(self._start_button)
+        self._history_button = QPushButton("Historiales", box)
+        self._history_button.clicked.connect(self._on_history)
+        buttons.addWidget(self._history_button)
+        self._back_button = QPushButton("Volver al chat", box)
+        self._back_button.setEnabled(False)
+        self._back_button.clicked.connect(self._on_back_from_history)
+        buttons.addWidget(self._back_button)
+        self._continue_button = QPushButton("Crear continuación", box)
+        self._continue_button.setEnabled(False)
+        self._continue_button.clicked.connect(self._on_create_continuation)
+        buttons.addWidget(self._continue_button)
         self._send_button = QPushButton(_SEND_TEXT, box)
         self._send_button.clicked.connect(self._on_send)
         self._send_button.setEnabled(False)
@@ -103,6 +128,12 @@ class ChatView(QWidget):
         self._close_button.clicked.connect(self._on_close)
         self._close_button.setEnabled(False)
         buttons.addWidget(self._close_button)
+
+        self._change_model_button = QPushButton("Cambiar modelo", box)
+        self._change_model_button.clicked.connect(
+            self.change_model_requested.emit
+        )
+        buttons.addWidget(self._change_model_button)
         layout.addLayout(buttons)
 
         self._service.session_opened.connect(self._on_session_opened)
@@ -125,6 +156,16 @@ class ChatView(QWidget):
 
     def set_artifact(self, artifact: Optional[LocalArtifact]) -> None:
         """Select (or clear) the artifact the chat will be opened for."""
+        # Same artifact: do not close/reopen session unnecessarily.
+        if artifact is not None and self._artifact is not None:
+            if (
+                self._artifact.model_id == artifact.model_id
+                and self._artifact.filename == artifact.filename
+                and self._artifact.quantization == artifact.quantization
+            ):
+                return
+        if artifact is None and self._artifact is None:
+            return
         self._artifact = artifact
         self._awaiting_turn = False
         self._last_prompt = None
@@ -168,7 +209,16 @@ class ChatView(QWidget):
         prompt = self._prompt.toPlainText().strip()
         if not prompt:
             return
-        accepted = self._service.send_turn(prompt)
+        if self._pending_summary:
+            composed = (
+                "Contexto proporcionado por el usuario:\n"
+                f"{self._pending_summary}\n\n"
+                f"Mensaje actual:\n{prompt}"
+            )
+            self._pending_summary = None
+        else:
+            composed = prompt
+        accepted = self._service.send_turn(composed)
         if not accepted:
             # Rejected (busy, no session, empty): nothing was sent, so the
             # conversation stays untouched and the input is preserved.
@@ -177,6 +227,7 @@ class ChatView(QWidget):
             self._update_controls()
             return
         self._prompt.clear()
+        self._messages.append({"role": "user", "content": prompt})
         self._append(f"Tú: {prompt}")
         self._awaiting_turn = True
         self._last_prompt = prompt
@@ -204,6 +255,191 @@ class ChatView(QWidget):
         self._update_controls()
         self.session_closed.emit()
 
+    def _delete_history(self, cid: str):
+        """Delete a saved conversation if it is not the active one.
+
+        Returns a tuple (status, detail) where status is one of:
+        'deleted', 'not_found', 'active', 'error'.
+        """
+        if cid == self._conversation_id:
+            return ('active', None)
+        if self._store is None:
+            return ('error', 'store not configured')
+        try:
+            ok = self._store.delete_conversation(cid)
+        except ConversationStoreError as exc:
+            return ('error', str(exc))
+        if ok:
+            return ('deleted', None)
+        return ('not_found', None)
+
+    def _on_history(self) -> None:
+        if self._store is None:
+            return
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QListWidget, QListWidgetItem
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Historiales guardados")
+        layout = QVBoxLayout(dlg)
+        lst = QListWidget(dlg)
+        layout.addWidget(lst)
+        for c in self._store.list_conversations():
+            label = f"{c.get('model_id') or '?'} | {c.get('artifact_filename') or '?'} | {c.get('message_count',0)} msgs"
+            item = QListWidgetItem(label)
+            item.setData(32, c["id"])
+            lst.addItem(item)
+        from PySide6.QtWidgets import QPushButton, QMessageBox, QInputDialog
+        del_btn = QPushButton("Eliminar", dlg)
+        rename_btn = QPushButton("Renombrar", dlg)
+        lst_layout = lst.parent().layout()
+        lst_layout.addWidget(rename_btn)
+        lst_layout.addWidget(del_btn)
+        def _update_del():
+            it = lst.currentItem()
+            if it is None:
+                del_btn.setEnabled(False); return
+            cid = it.data(32)
+            del_btn.setEnabled(cid != self._conversation_id)
+        lst.currentItemChanged.connect(lambda *_: _update_del())
+        _update_del()
+        def _do_delete():
+            it = lst.currentItem()
+            if it is None: return
+            cid = it.data(32)
+            if cid == self._conversation_id:
+                return
+            meta = None
+            for c in self._store.list_conversations():
+                if c["id"] == cid:
+                    meta = c; break
+            desc = f"{meta.get('model_id') if meta else '?'} | {meta.get('artifact_filename') if meta else '?'}"
+            if QMessageBox.question(dlg, "Confirmar", f"Eliminar {desc}?") != QMessageBox.StandardButton.Yes:
+                return
+            status, detail = self._delete_history(cid)
+            if status == 'active':
+                return
+            if status == 'error':
+                QMessageBox.warning(dlg, "Error", detail or "Error"); return
+            if status == 'not_found':
+                QMessageBox.information(dlg, "No encontrado", "La conversación ya no existe.")
+            # refresh list
+            lst.clear()
+            for c in self._store.list_conversations():
+                label = f"{c.get('model_id') or '?'} | {c.get('artifact_filename') or '?'} | {c.get('message_count',0)} msgs"
+                item = QListWidgetItem(label)
+                item.setData(32, c["id"])
+                lst.addItem(item)
+            _update_del()
+        def _do_rename():
+            it = lst.currentItem()
+            if it is None:
+                return
+            cid = it.data(32)
+            current_title = ""
+            for c in self._store.list_conversations():
+                if c["id"] == cid:
+                    current_title = c.get("title") or ""
+                    break
+            text, ok = QInputDialog.getText(dlg, "Renombrar", "Título:", text=current_title)
+            if not ok:
+                return
+            if not text.strip():
+                QMessageBox.warning(dlg, "Error", "El título no puede estar vacío.")
+                return
+            try:
+                renamed = self._store.rename_conversation(cid, text)
+            except Exception as exc:  # noqa: BLE001
+                QMessageBox.warning(dlg, "Error", str(exc))
+                return
+            if not renamed:
+                QMessageBox.information(dlg, "No encontrado", "La conversación ya no existe.")
+                return
+            # refresh list preserving selection
+            selected = cid
+            lst.clear()
+            for c in self._store.list_conversations():
+                label = c.get("title") or f"{c.get('model_id') or '?'} | {c.get('artifact_filename') or '?'} | {c.get('message_count',0)} msgs"
+                item = QListWidgetItem(label)
+                item.setData(32, c["id"])
+                lst.addItem(item)
+                if c["id"] == selected:
+                    lst.setCurrentItem(item)
+            _update_del()
+        rename_btn.clicked.connect(_do_rename)
+        del_btn.clicked.connect(_do_delete)
+        dlg.resize(400, 300)
+        if dlg.exec():
+            item = lst.currentItem()
+            if item is None:
+                return
+            cid = item.data(32)
+            msgs = self._store.load_conversation(cid)
+            self._saved_history = self._history.toPlainText()
+            self._saved_status = self._status.text()
+            self._history_mode = True
+            self._history.clear()
+            for m in msgs:
+                self._history.append(f"{m['role']}: {m['content']}")
+            self._status.setText("Historial guardado (solo lectura).")
+            self._prompt.setEnabled(False)
+            self._send_button.setEnabled(False)
+            self._back_button.setEnabled(True)
+            self._continue_button.setEnabled(True)
+
+    def _on_back_from_history(self) -> None:
+        if not self._history_mode:
+            return
+        self._history.setPlainText(self._saved_history)
+        self._status.setText(self._saved_status)
+        self._history_mode = False
+        self._back_button.setEnabled(False)
+        has_session = self._session_id is not None
+        self._send_button.setEnabled(has_session)
+        self._prompt.setEnabled(has_session)
+
+    def _on_create_continuation(self) -> None:
+        if not self._history_mode:
+            return
+        if self._session_id is not None:
+            self._status.setText("Ya hay una sesión activa; ciérrala antes de continuar.")
+            return
+        artifact = self._artifact
+        if artifact is None:
+            self._status.setText(_NO_ARTIFACT_TEXT)
+            return
+        from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
+        dlg = QDialog(self)
+        dlg.setWindowTitle("Crear continuación")
+        layout = QVBoxLayout(dlg)
+        layout.addWidget(QLabel("Se abrirá una sesión nueva. El modelo no recuperará automáticamente la sesión original."))
+        summary = QTextEdit(dlg)
+        layout.addWidget(summary)
+        btns = QHBoxLayout()
+        ok = QPushButton("Crear", dlg)
+        cancel = QPushButton("Cancelar", dlg)
+        btns.addWidget(ok)
+        btns.addWidget(cancel)
+        layout.addLayout(btns)
+        ok.clicked.connect(dlg.accept)
+        cancel.clicked.connect(dlg.reject)
+        if not dlg.exec():
+            return
+        text = summary.toPlainText().strip()
+        self._pending_summary = text or None
+        self._history_mode = False
+        self._back_button.setEnabled(False)
+        self._continue_button.setEnabled(False)
+        self._history.setPlainText(self._saved_history)
+        self._status.setText(self._saved_status)
+        accepted = self._service.open_session(artifact.model_id, filename=artifact.filename, quantization=artifact.quantization)
+        if not accepted:
+            self._pending_summary = None
+            self._status.setText("No se pudo abrir la sesión.")
+            self._update_controls()
+            return
+        self._history.clear()
+        self._status.setText(_OPENING_TEXT)
+        self._update_controls()
+
     def invalidate(self) -> None:
         """Drop pending results (window close / Core shutdown)."""
         self._service.invalidate()
@@ -218,6 +454,8 @@ class ChatView(QWidget):
 
     def _on_session_opened(self, session_id: str, model_id: str) -> None:
         self._session_id = session_id
+        self._conversation_id = str(uuid.uuid4())
+        self._messages = []
         self._status.setText(f"Sesión de chat abierta en el Core ({model_id}).")
         self._prompt.setEnabled(True)
         self._update_controls()
@@ -230,9 +468,22 @@ class ChatView(QWidget):
             self._status.setText(
                 f"Respuesta recibida sin contenido ({turn_count} turno(s))."
             )
+            assistant_text = ""
         else:
             self._append(f"Core ({turn_count}): {response}")
             self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
+            assistant_text = response
+        self._messages.append({"role": "assistant", "content": assistant_text})
+        if self._store is not None and self._conversation_id is not None:
+            try:
+                self._store.save_conversation(
+                    self._conversation_id,
+                    self._messages,
+                    model_id=self._artifact.model_id if self._artifact else None,
+                    artifact_filename=self._artifact.filename if self._artifact else None,
+                )
+            except Exception:  # noqa: BLE001
+                self._status.setText("Error al persistir la conversación.")
 
     def _on_failed(self, message: str) -> None:
         if self._awaiting_turn:

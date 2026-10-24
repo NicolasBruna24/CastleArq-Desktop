@@ -686,14 +686,14 @@ def test_diagnostics_carry_no_traceback():
 # ---------------------------------------------------------------------------
 
 def test_allowlist_matches_admitted_set_and_result_snapshot_is_defensive():
-    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0"})
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0", "0.6.1"})
     res = discover_core_update(
         python_path=None,
         fetch=_fetch_ok("0.5.1"),
     )
-    assert res.admitted_versions == frozenset({"0.5.1", "0.6.0"})
+    assert res.admitted_versions == frozenset({"0.5.1", "0.6.0", "0.6.1"})
     assert isinstance(res.admitted_versions, frozenset)
-    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0"})
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0", "0.6.1"})
 
 
 def test_discovery_does_not_touch_global_error_vocabulary():

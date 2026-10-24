@@ -30,11 +30,22 @@ from __future__ import annotations
 
 import weakref
 from dataclasses import dataclass, field
+from enum import Enum
 from typing import Any, Callable, FrozenSet, Optional
+
+
+
+import json
+import socket
+from urllib.error import URLError
+
+from castlearq_desktop.core.readiness_client import HttpRequestTimeout
 
 from castlearq_desktop.core.contracts import Deadline
 from castlearq_desktop.core.contracts import ErrorCode
 from castlearq_desktop.core.contracts import VersionAdmission
+from castlearq_desktop.core.readiness_client import urllib_transport  # noqa: F401
+from castlearq_desktop.core.readiness_client import ProbeObservation  # noqa: F401
 from castlearq_desktop.core.interpreter_settings import InterpreterSettingsStore
 from castlearq_desktop.core.interpreter_validator import validate_python_interpreter
 from castlearq_desktop.core.lifecycle_manager import LifecycleManager
@@ -44,7 +55,13 @@ from castlearq_desktop.core.readiness_client import HttpProbeResponse
 from castlearq_desktop.core.readiness_client import ReadinessHttpClient
 from castlearq_desktop.core.readiness_client import ReadinessWaitResult
 from castlearq_desktop.core.subprocess_adapter import SubprocessProcessAdapter
-from castlearq_desktop.core.version_admission import SUPPORTED_CORE_VERSIONS
+from castlearq_desktop.core.version_admission import (
+    extract_health_version,
+    HEALTH_VERSION_FIELD,
+    is_valid_version,
+    classify_version_admission,
+    SUPPORTED_CORE_VERSIONS,
+)
 from castlearq_desktop.core.version_admission import query_installed_core_version
 
 
@@ -409,6 +426,265 @@ class CoreStartupCoordinator:
         checker.start(now=start, deadline=active)
         return checker
 
+# Part 1: signature, docstring, imports, base_url, transport, probes.
+# This file is a fragment; do not run it directly.
+
+    def connect_existing(
+        self,
+        *,
+        now: Optional[float] = None,
+        deadline: Optional[Deadline] = None,
+        base_url: Optional[str] = None,
+        installed_version_provider: Optional[Callable[[], Optional[str]]] = None,
+    ) -> ConnectionAdmission:
+        """Check if a compatible Core instance is already running (Desktop).
+
+        Probes the Core HTTP endpoints (/health, /v1/models, /v1/artifacts) using
+        the configured transport without launching any process.
+
+        Version admission uses the central DEC-A classifier over the remote Core
+        version observed in GET /health and Desktop's installed version (supplied
+        by *installed_version_provider* when configured). Fail-closed: a version
+        that is format-valid but not admitted by the central allowlist is reported
+        as incompatible; when the installed version is unavailable without
+        launching a subprocess the admission is reported as *not evaluated*.
+
+        Returns a ConnectionAdmission. *status* carries the outcome; *code* reuses
+        existing ErrorCode values where an approved code exists; *version_admission*
+        carries the DEC-A classification; *version* is the version observed in
+        GET /health when present.
+        """
+        from castlearq_desktop.core.contracts.readiness import (
+            HEALTH_PATH,
+            MODELS_PATH,
+            ARTIFACTS_PATH,
+            is_http_success,
+        )
+        from urllib.error import URLError
+
+        # Use provided base URL or default from the port-conflict config.
+        if base_url is None:
+            base_url = self._get_base_url()
+        if base_url is None:
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.NOT_CONFIGURED,
+                code=None,
+                version_admission=VersionAdmission.NOT_EVALUATED,
+                version=None,
+                detail="No Core base URL configured and none supplied.",
+                context={"base_url": base_url},
+            )
+
+        # Build the transport (test injection or the standard urllib transport).
+        transport = self.transport if self.transport is not None else urllib_transport(base_url)
+
+        # Probe the models endpoint first.
+        raw_models = None
+        try:
+            raw_models = transport(MODELS_PATH, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001 - probe-local classification
+            status = self._classify_probe_error(exc)
+            if status is ConnectionAdmissionStatus.TIMEOUT:
+                return ConnectionAdmission(
+                    status=ConnectionAdmissionStatus.TIMEOUT,
+                    code=None,
+                    version_admission=VersionAdmission.NOT_EVALUATED,
+                    version=None,
+                    detail="GET /v1/models timed out.",
+                    context={"path": MODELS_PATH},
+                )
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.CONNECTION_REFUSED,
+                code=None,
+                version_admission=VersionAdmission.NOT_EVALUATED,
+                version=None,
+                detail="GET /v1/models did not connect.",
+                context={"path": MODELS_PATH, "error_type": type(exc).__name__},
+            )
+
+        # Probe the health endpoint.
+        raw_health = None
+        try:
+            raw_health = transport(HEALTH_PATH, timeout=5.0)
+        except Exception as exc:  # noqa: BLE001
+            status = self._classify_probe_error(exc)
+            if status is ConnectionAdmissionStatus.TIMEOUT:
+                return ConnectionAdmission(
+                    status=ConnectionAdmissionStatus.TIMEOUT,
+                    code=None,
+                    version_admission=VersionAdmission.NOT_EVALUATED,
+                    version=None,
+                    detail="GET /health timed out.",
+                    context={"path": HEALTH_PATH},
+                )
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.CONNECTION_REFUSED,
+                code=None,
+                version_admission=VersionAdmission.NOT_EVALUATED,
+                version=None,
+                detail="GET /health did not connect.",
+                context={"path": HEALTH_PATH, "error_type": type(exc).__name__},
+            )
+
+        # Required endpoint failed -> not an admitted connection.
+        models_status = getattr(raw_models, "status", None) if raw_models is not None else None
+        if not is_http_success(models_status):
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.HTTP_ERROR,
+                code=ErrorCode.API_PROBE_FAILED,
+                version_admission=VersionAdmission.NOT_EVALUATED,
+                version=None,
+                detail="GET /v1/models did not return a 2xx status.",
+                context={"path": MODELS_PATH, "status": models_status},
+            )
+
+        # If health fails, report HEALTH_CHECK_FAILED.
+        health_status = getattr(raw_health, "status", None) if raw_health is not None else None
+        if not is_http_success(health_status):
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.HTTP_ERROR,
+                code=ErrorCode.HEALTH_CHECK_FAILED,
+                version_admission=VersionAdmission.NOT_EVALUATED,
+                version=None,
+                detail="GET /health did not return a 2xx status.",
+                context={"path": HEALTH_PATH, "status": health_status},
+            )
+
+        # Version admission (DEC-A): present but malformed is incompatible;
+        # present and valid is classified against the central allowlist.
+        body = raw_health.body
+        version_admission = VersionAdmission.NOT_EVALUATED
+        version: Optional[str] = None
+        if body is not None:
+            # A non-JSON body is an invalid response, not a missing version.
+            try:
+                json.loads(body)
+            except (ValueError, TypeError):
+                return ConnectionAdmission(
+                    status=ConnectionAdmissionStatus.INVALID_RESPONSE,
+                    code=None,
+                    version_admission=VersionAdmission.MALFORMED,
+                    version=None,
+                    detail="GET /health body is not valid JSON.",
+                    context={"path": HEALTH_PATH},
+                )
+            present, health_version = extract_health_version(body)
+            if not present:
+                return ConnectionAdmission(
+                    status=ConnectionAdmissionStatus.MISSING_VERSION,
+                    code=None,
+                    version_admission=VersionAdmission.MISSING,
+                    version=None,
+                    detail="GET /health returned no version field.",
+                    context={"path": HEALTH_PATH},
+                )
+            if not is_valid_version(health_version):
+                return ConnectionAdmission(
+                    status=ConnectionAdmissionStatus.MALFORMED_VERSION,
+                    code=ErrorCode.API_CONTRACT_INCOMPATIBLE,
+                    version_admission=VersionAdmission.MALFORMED,
+                    version=health_version,
+                    detail="GET /health version is not a valid version string.",
+                    context={"version": health_version, "path": HEALTH_PATH},
+                )
+            version = health_version
+            # Resolved provider: a call-time override takes precedence over the
+            # configured installed-version provider. Either way, a missing
+            # provider means admission cannot be concluded without spawning a
+            # subprocess; no subprocess is launched here.
+            provider = installed_version_provider if installed_version_provider is not None else self.installed_version_provider
+            if provider is None:
+                version_admission = VersionAdmission.NOT_EVALUATED
+            else:
+                installed = provider()
+                if installed is None:
+                    version_admission = VersionAdmission.NOT_EVALUATED
+                else:
+                    version_admission = classify_version_admission(
+                        installed,
+                        version,
+                        supported_versions=self.supported_versions,
+                    )
+
+        # Artifacts is optional at this desktop-level probe; a failure never
+        # drives the outcome, it is informational only.
+        try:
+            transport(ARTIFACTS_PATH, timeout=5.0)
+        except Exception:  # noqa: BLE001
+            pass
+
+        if version_admission is VersionAdmission.ADMITTED:
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.ADMITTED,
+                code=None,
+                version_admission=VersionAdmission.ADMITTED,
+                version=version,
+                detail="Core connection admitted and ready.",
+                context={"version": version, "path": HEALTH_PATH},
+            )
+
+        # Version valid but not admitted: match against the central allowlist.
+        if version_admission in (
+            VersionAdmission.INCOMPATIBLE,
+            VersionAdmission.UNKNOWN,
+        ):
+            return ConnectionAdmission(
+                status=ConnectionAdmissionStatus.INCOMPATIBLE_VERSION,
+                code=ErrorCode.API_CONTRACT_INCOMPATIBLE,
+                version_admission=version_admission,
+                version=version,
+                detail="Core version is format-valid but not admitted by DEC-A.",
+                context={"version": version, "admission": version_admission.value},
+            )
+
+        # Remaining version outcomes: unclassified or not concluded.
+        detail = {
+            VersionAdmission.MISSING: "GET /health returned no version field.",
+            VersionAdmission.MALFORMED: "GET /health version is not a valid version string.",
+            VersionAdmission.NOT_EVALUATED: "Installed version unavailable; admission not concluded.",
+            VersionAdmission.UNKNOWN: "Core version is format-valid but not admitted by DEC-A.",
+        }.get(version_admission, "Core version admission not concluded.")
+
+        return ConnectionAdmission(
+            status=ConnectionAdmissionStatus.INCOMPATIBLE_VERSION
+            if version_admission in (
+                VersionAdmission.INCOMPATIBLE,
+                VersionAdmission.UNKNOWN,
+            )
+            else ConnectionAdmissionStatus.NOT_EVALUATED,
+            code=ErrorCode.API_CONTRACT_INCOMPATIBLE
+            if version_admission in (
+                VersionAdmission.INCOMPATIBLE,
+                VersionAdmission.UNKNOWN,
+            )
+            else None,
+            version_admission=version_admission,
+            version=version,
+            detail=detail,
+            context={"version": version, "admission": version_admission.value},
+        )
+
+    @staticmethod
+    def _classify_probe_error(exc: BaseException) -> ConnectionAdmissionStatus:
+        """Classify a transport-level probe failure without launching a subprocess.
+
+        Uses the platform's socket timeout exception so that a plain timeout is
+        reported as :attr:`ConnectionAdmissionStatus.TIMEOUT` instead of a
+        refused connection.
+        """
+        if isinstance(exc, HttpRequestTimeout):
+            return ConnectionAdmissionStatus.TIMEOUT
+        if isinstance(exc, URLError) and isinstance(
+            exc.reason, (socket.timeout, TimeoutError)
+        ):
+            return ConnectionAdmissionStatus.TIMEOUT
+        return ConnectionAdmissionStatus.CONNECTION_REFUSED
+
+    def _get_base_url(self) -> Optional[str]:
+        """Get the base URL for Core connection check."""
+        from castlearq_desktop.core.contracts.port_conflict import CORE_HOST, CORE_PORT
+        return f"http://{CORE_HOST}:{CORE_PORT}"
+
     def _on_readiness_result(self, result: ReadinessWaitResult) -> None:
         self._last_readiness_result = result
         self._active_transport = None
@@ -416,8 +692,6 @@ class CoreStartupCoordinator:
     def _on_readiness_error(self, exc: Exception) -> None:
         self._last_readiness_error = exc
         self._active_transport = None
-
-
 class _CountingAdapter(SubprocessProcessAdapter):
     """Adapter that counts spawns (no behaviour change)."""
 
@@ -429,6 +703,45 @@ class _CountingAdapter(SubprocessProcessAdapter):
     def spawn(self, argv, *, shell):
         self._owner.spawn_calls += 1
         return super().spawn(argv, shell=shell)
+
+
+
+class ConnectionAdmissionStatus(Enum):
+    """Outcome of a Desktop-level connection admission (connect_existing).
+
+    Desktop-level: this is not a Core readiness contract. ErrorCode members are
+    reused from :mod:`contracts.errors` where an approved code exists; otherwise
+    the outcome is reported as an unclassified status.
+    """
+
+    ADMITTED = "admitted"
+    CONNECTION_REFUSED = "connection_refused"
+    NOT_CONFIGURED = "not_configured"
+    TIMEOUT = "timeout"
+    HTTP_ERROR = "http_error"
+    INVALID_RESPONSE = "invalid_response"
+    MALFORMED_VERSION = "malformed_version"
+    INCOMPATIBLE_VERSION = "incompatible_version"
+    MISSING_VERSION = "missing_version"
+    NOT_EVALUATED = "not_evaluated"
+
+
+@dataclass(frozen=True)
+class ConnectionAdmission:
+    """Outcome of a Desktop-level connection admission.
+
+    ``status`` carries the outcome; ``code`` reuses existing ErrorCode values
+    where an approved code exists; ``version_admission`` carries the DEC-A
+    classification; ``version`` is the version observed in GET /health
+    (if any); ``context`` carries structured diagnostics.
+    """
+
+    status: ConnectionAdmissionStatus
+    code: Optional[ErrorCode]
+    version_admission: VersionAdmission
+    version: Optional[str]
+    detail: str
+    context: Dict[str, Any] = field(default_factory=dict)
 
 
 __all__ = ["CoreStartupCoordinator", "manager_liveness"]

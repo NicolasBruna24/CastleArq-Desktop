@@ -86,6 +86,78 @@ class InterpreterSettingsStore:
         self._settings.remove(PYTHON_INTERPRETER_PATH_KEY)  # type: ignore[attr-defined]
         self._settings.sync()  # type: ignore[attr-defined]
 
+    def load_interpreter(self) -> Optional[str]:
+        """Return the saved interpreter path, or ``None`` when unconfigured.
+
+        No fallback discovery of any kind is performed: what is stored is what
+        is returned.
+        """
+        return self.load()
+
+    def save_interpreter(self, path: str) -> None:
+        """Persist *path* as the explicit selection.
+
+        Only non-empty absolute paths are accepted; anything else raises
+        ``ValueError`` before any write occurs. Re-saving replaces the previous
+        selection (explicit replacement).
+        """
+        return self.save(path)
+
+    def clear_interpreter(self) -> None:
+        """Forget the explicit selection (back to unconfigured)."""
+        return self.clear()
+
+    core_working_directory_key = "core_working_directory"
+
+    def load_core_working_directory(self) -> Optional[str]:
+        """Return the saved core working directory, or ``None`` when unconfigured.
+
+        No fallback discovery of any kind is performed: what is stored is what
+        is returned. If set, the value is used as ``cwd`` when executing Core
+        subprocesses.
+        """
+        value = self._settings.value(  # type: ignore[attr-defined]
+            self.core_working_directory_key, defaultValue=None
+        )
+        if value is None:
+            return None
+        path = str(value)
+        return path or None
+
+    def save_core_working_directory(self, path: str) -> None:
+        """Persist *path* as the core working directory.
+
+        Only non-empty absolute paths are accepted; anything else raises
+        ``ValueError`` before any write occurs. Re-saving replaces the previous
+        selection (explicit replacement).
+        """
+        if not isinstance(path, str) or not path.strip():
+            raise ValueError(
+                "A core working directory path must be a non-empty string."
+            )
+        if not os.path.isabs(path):
+            raise ValueError(
+                "A core working directory path must be absolute; no PATH lookup is performed."
+            )
+        if not os.path.isdir(path):
+            raise ValueError(
+                f"El directorio de trabajo de Core no existe o no es un directorio: {path}"
+            )
+        # Additional validation: must contain castlearq/main.py
+        main_py = os.path.join(path, "castlearq", "main.py")
+        if not os.path.isfile(main_py):
+            raise ValueError(
+                f"El directorio de trabajo de Core no contiene castlearq/main.py: {path}. "
+                "Por favor, selecciona la raíz del repositorio Core (por ejemplo, /home/brunapc/LocalAI Hub)."
+            )
+        self._settings.setValue(self.core_working_directory_key, path)  # type: ignore[attr-defined]
+        self._settings.sync()  # type: ignore[attr-defined]
+
+    def clear_core_working_directory(self) -> None:
+        """Forget the core working directory (back to unconfigured)."""
+        self._settings.remove(self.core_working_directory_key)  # type: ignore[attr-defined]
+        self._settings.sync()  # type: ignore[attr-defined]
+
 
 def create_interpreter_settings() -> InterpreterSettingsStore:
     """Build a store backed by a real ``QSettings`` using the approved identity.

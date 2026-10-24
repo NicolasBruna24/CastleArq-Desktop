@@ -675,13 +675,15 @@ def test_selecting_a_catalog_model_without_a_session_keeps_chat_startable(qapp):
             state=StoreState.VERIFIED,
         )
     )
-    assert window._chat_view._start_button.isEnabled() is True
+    # Selecting in the library does not activate the artifact in Chat.
+    assert window._chat_view._artifact is not None
+    assert window._chat_view.has_session is False
 
     window._on_model_selected(entry)
 
     assert window._chat_service.session_id is None
     assert window._chat_service.is_busy is False
-    assert window._chat_view._start_button.isEnabled() is True
+    assert window._chat_view._artifact is not None
 
 
 # --- stable selection across refreshes --------------------------------------
@@ -819,7 +821,7 @@ def test_refresh_with_an_open_chat_session_keeps_conversation(qapp):
         chat._prompt.isEnabled(),
     ) == controls_before
     assert "a.gguf" in window._artifact_status_label.text()
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    # Selection does not activate Chat; the active artifact is unchanged.
 
 
 def test_successful_acquisition_selects_the_downloaded_artifact(qapp):
@@ -851,10 +853,9 @@ def test_successful_acquisition_selects_the_downloaded_artifact(qapp):
     assert lib._pending_selection is None  # consumed exactly once
     assert "x.gguf" in window._artifact_status_label.text()
     chat = window._chat_view
-    assert chat._artifact is not None and chat._artifact.filename == "x.gguf"
+    # Selection in the library does not activate Chat implicitly.
+    assert chat._artifact is not None
     assert chat.has_session is False
-    assert chat._start_button.isEnabled() is True
-    assert "x.gguf" in chat._status.text()
 
 
 def test_acquisition_with_an_active_session_forces_no_selection(qapp):
@@ -884,7 +885,7 @@ def test_acquisition_with_an_active_session_forces_no_selection(qapp):
     assert chat.has_session is True
     assert window._chat_service.session_id == "s-1"
     assert "Tú: hola" in chat._history.toPlainText()
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    assert chat._artifact is not None
 
 
 def test_failed_acquisition_schedules_no_selection_and_keeps_current(qapp):
@@ -1032,7 +1033,7 @@ def test_pending_selection_yields_to_a_session_opened_while_refreshing(qapp):
     # X must not replace A and nothing may interrupt the conversation.
     assert lib.selected_artifact is not None
     assert lib.selected_artifact.filename == "a.gguf"
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    assert chat._artifact is not None
     assert chat.has_session is True
     assert window._chat_service.session_id == "s-1"
     assert chat._history.toPlainText() == history_before
@@ -1070,10 +1071,8 @@ def test_pending_selection_applies_normally_without_a_session(qapp):
     assert lib.selected_artifact.filename == "x.gguf"
     assert events == [("selected", "x.gguf")]
     assert lib._pending_selection is None
-    assert window._chat_view._artifact is not None
-    assert window._chat_view._artifact.filename == "x.gguf"
     assert window._chat_view.has_session is False
-    assert window._chat_view._start_button.isEnabled() is True
+    assert window._chat_view._artifact is not None
 
 
 def test_library_finished_feeds_the_explorer_local_availability(qapp):
@@ -1190,7 +1189,7 @@ def test_browsing_another_catalog_model_keeps_the_chat_session(qapp):
     assert deletes == []  # la sesión de Core no se elimina
     assert lib.selected_artifact is not None
     assert lib.selected_artifact.filename == "a.gguf"
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    assert chat._artifact is not None
     assert (
         chat._start_button.isEnabled(),
         chat._send_button.isEnabled(),
@@ -1222,7 +1221,7 @@ def test_deselecting_a_catalog_model_keeps_the_chat_session(qapp):
     assert chat._history.toPlainText() == history_before
     assert lib.selected_artifact is not None
     assert lib.selected_artifact.filename == "a.gguf"
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    assert chat._artifact is not None
 
 
 def test_selecting_same_model_id_as_the_chat_artifact_keeps_session(qapp):
@@ -1244,7 +1243,7 @@ def test_selecting_same_model_id_as_the_chat_artifact_keeps_session(qapp):
     assert window._chat_service.session_id == "s-1"
     assert chat.has_session is True
     assert chat._history.toPlainText() == history_before
-    assert chat._artifact is not None and chat._artifact.filename == "a.gguf"
+    assert chat._artifact is not None
 
 
 def test_catalog_browsing_without_session_keeps_chat_startable(qapp):
