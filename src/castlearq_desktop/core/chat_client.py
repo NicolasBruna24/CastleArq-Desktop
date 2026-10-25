@@ -126,6 +126,8 @@ class CoreChatClient:
         *,
         filename: Optional[str] = None,
         quantization: Optional[str] = None,
+        device: Optional[str] = None,
+
     ) -> ChatSessionInfo:
         """Open a chat session on Core for *model_id*.
 
@@ -143,6 +145,9 @@ class CoreChatClient:
             payload["filename"] = filename
         if quantization:
             payload["quantization"] = quantization
+        if device:
+            payload["device"] = device
+
         status, body = self._request(
             "POST", CHAT_SESSIONS_PATH, payload, CONTROL_TIMEOUT_SECONDS
         )

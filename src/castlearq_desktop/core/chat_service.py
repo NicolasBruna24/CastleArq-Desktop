@@ -84,6 +84,8 @@ class _ChatRunnable(QRunnable):
         model_id: Optional[str] = None,
         filename: Optional[str] = None,
         quantization: Optional[str] = None,
+        device: Optional[str] = None,
+
         session_id: Optional[str] = None,
         prompt: Optional[str] = None,
     ) -> None:
@@ -95,6 +97,8 @@ class _ChatRunnable(QRunnable):
         self._model_id = model_id
         self._filename = filename
         self._quantization = quantization
+        self._device = device
+
         self._session_id = session_id
         self._prompt = prompt
         self.setAutoDelete(True)
@@ -106,6 +110,8 @@ class _ChatRunnable(QRunnable):
                     self._model_id or "",
                     filename=self._filename,
                     quantization=self._quantization,
+                    device=self._device,
+
                 )
                 payload = (self._generation, "opened", info, None)
             elif self._operation == "turn":
@@ -189,6 +195,8 @@ class ChatService(QObject):
         *,
         filename: Optional[str] = None,
         quantization: Optional[str] = None,
+        device: Optional[str] = None,
+
     ) -> bool:
         """Open a chat session on Core. Returns False when refused."""
         if self._shutting_down or self.is_busy:
@@ -214,6 +222,8 @@ class ChatService(QObject):
             model_id=model_id,
             filename=filename,
             quantization=quantization,
+            device=device,
+
         )
         return True
 

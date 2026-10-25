@@ -32,6 +32,8 @@ import uuid
 
 from PySide6.QtCore import Qt, Signal
 from PySide6.QtWidgets import (
+    QComboBox,
+
     QDialog,
     QGroupBox,
     QListWidget,
@@ -94,7 +96,19 @@ class ChatView(QWidget):
         self._status.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
+
         layout.addWidget(self._status)
+        self._device_label = QLabel("Dispositivo:", box)
+        self._device_combo = QComboBox(box)
+        self._device_combo.addItems(["CPU", "GPU"])
+        self._device_combo.setCurrentText("CPU")
+        device_row = QHBoxLayout()
+        device_row.addWidget(self._device_label)
+        device_row.addWidget(self._device_combo)
+        layout.addLayout(device_row)
+        self._device_label.setVisible(False)
+        self._device_combo.setVisible(False)
+
 
         self._history = QTextBrowser(box)
         self._history.setReadOnly(True)
@@ -167,6 +181,12 @@ class ChatView(QWidget):
         if artifact is None and self._artifact is None:
             return
         self._artifact = artifact
+        is_ov = artifact is not None and getattr(artifact, "backend", None) == "openvino"
+        self._device_combo.setVisible(is_ov)
+        self._device_label.setVisible(is_ov)
+        if is_ov:
+            self._device_combo.setCurrentText("CPU")
+
         self._awaiting_turn = False
         self._last_prompt = None
         if self._session_id is not None:
@@ -193,6 +213,8 @@ class ChatView(QWidget):
             artifact.model_id,
             filename=artifact.filename,
             quantization=artifact.quantization,
+            device=self._device_combo.currentText() if getattr(artifact, "backend", None) == "openvino" else None,
+
         )
         if not accepted:
             # Refused (busy, duplicate open, missing model): the visible

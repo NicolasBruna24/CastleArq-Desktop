@@ -59,7 +59,7 @@ class FakeService(QObject):
         self.invalidations = 0
 
     def open_session(
-        self, model_id: str, *, filename: Optional[str] = None, quantization: Optional[str] = None
+        self, model_id: str, *, filename: Optional[str] = None, quantization: Optional[str] = None, device: Optional[str] = None
     ) -> bool:
         if self.refuse_open:
             return False
