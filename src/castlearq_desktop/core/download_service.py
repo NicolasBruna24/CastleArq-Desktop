@@ -378,6 +378,7 @@ class LocalArtifact:
 
     model_id: str
     filename: str
+    backend: Optional[str] = None
     quantization: Optional[str] = None
     size_bytes: Optional[int] = None
     state: Optional[StoreState] = None
@@ -427,10 +428,16 @@ def parse_artifacts(text: str) -> tuple[list[LocalArtifact], Optional[str]]:
             problem = entry.get("problem")
             if not isinstance(problem, str) or not problem:
                 problem = None
+            backend = entry.get("backend")
+            if backend in ("gguf", "openvino"):
+                pass
+            else:
+                backend = None
             artifacts.append(
                 LocalArtifact(
                     model_id=model_id,
                     filename=filename,
+                    backend=backend,
                     quantization=read_quantization(entry),
                     size_bytes=size_bytes,
                     state=read_store_state(entry),

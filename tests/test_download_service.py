@@ -516,4 +516,49 @@ def test_close_prevents_new_requests(qapp):
     assert service.request_download(Request(model_id="m")) is False
 
 
+def _doc_with_backend(backend):
+    entry = {"model_id": "m", "filename": "f.gguf"}
+    if backend is not _UNSET:
+        entry["backend"] = backend
+    return _list_document([entry])
+
+
+_UNSET = object()
+
+
+def test_parse_artifacts_backend_gguf():
+    from castlearq_desktop.core.download_service import parse_artifacts
+    arts, err = parse_artifacts(_doc_with_backend("gguf"))
+    assert err is None
+    assert arts[0].backend == "gguf"
+
+
+def test_parse_artifacts_backend_openvino():
+    from castlearq_desktop.core.download_service import parse_artifacts
+    arts, err = parse_artifacts(_doc_with_backend("openvino"))
+    assert err is None
+    assert arts[0].backend == "openvino"
+
+
+def test_parse_artifacts_backend_absent():
+    from castlearq_desktop.core.download_service import parse_artifacts
+    arts, err = parse_artifacts(_doc_with_backend(_UNSET))
+    assert err is None
+    assert arts[0].backend is None
+
+
+def test_parse_artifacts_backend_null():
+    from castlearq_desktop.core.download_service import parse_artifacts
+    arts, err = parse_artifacts(_doc_with_backend(None))
+    assert err is None
+    assert arts[0].backend is None
+
+
+def test_parse_artifacts_backend_unexpected():
+    from castlearq_desktop.core.download_service import parse_artifacts
+    arts, err = parse_artifacts(_doc_with_backend("foo"))
+    assert err is None
+    assert arts[0].backend is None
+
+
 __all__ = []
