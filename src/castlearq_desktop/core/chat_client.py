@@ -86,10 +86,12 @@ class ChatClientError(Exception):
         *,
         status: Optional[int] = None,
         reason: str = "error",
+        detail: Optional[str] = None,
     ) -> None:
         self.user_message = user_message
         self.status = status
         self.reason = reason
+        self.detail = detail
         super().__init__(user_message)
 
     def __str__(self) -> str:  # pragma: no cover - trivial
@@ -298,6 +300,7 @@ def translate_error(status: int, body: Any = None) -> ChatClientError:
             "El Core no encontró el modelo o el artefacto indicado.",
             status=status,
             reason="not_found",
+            detail=detail,
         )
     if status == 409:
         return ChatClientError(
