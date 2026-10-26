@@ -36,6 +36,7 @@ class OpenVINOInferResult:
     text: str
     model_id: str
     effective_device: str
+    finish_reason: Optional[str] = None
 
 
 def _extract_detail(body):
@@ -87,7 +88,7 @@ class CoreOpenVINOClient:
         self._base_url = base_url.rstrip("/")
         self._transport = transport or urllib_openvino_transport(self._base_url)
 
-    def infer(self, model_id, prompt, device="CPU", max_tokens=8, timeout=INFERENCE_TIMEOUT_SECONDS):
+    def infer(self, model_id, prompt, device="CPU", max_tokens=512, timeout=INFERENCE_TIMEOUT_SECONDS):
         if not isinstance(model_id, str) or not model_id.strip():
             raise OpenVINOClientError("model_id es obligatorio.", reason="validation")
         if not isinstance(prompt, str) or not prompt.strip():
@@ -115,9 +116,10 @@ class CoreOpenVINOClient:
         text = payload.get("text")
         mid = payload.get("model_id")
         dev = payload.get("effective_device", "unknown")
+        finish_reason = payload.get("finish_reason")
         if not isinstance(text, str) or not isinstance(mid, str):
             raise OpenVINOClientError("Respuesta inválida de Core.", status=status, reason="invalid_response")
-        return OpenVINOInferResult(text=text, model_id=mid, effective_device=str(dev))
+        return OpenVINOInferResult(text=text, model_id=mid, effective_device=str(dev), finish_reason=finish_reason if isinstance(finish_reason, (str, type(None))) else str(finish_reason))
 
 
 def urllib_openvino_transport(base_url):

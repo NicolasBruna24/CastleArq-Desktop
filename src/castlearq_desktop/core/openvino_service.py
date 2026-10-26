@@ -4,8 +4,15 @@ from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
 from castlearq_desktop.core.openvino_client import CoreOpenVINOClient, OpenVINOClientError, OpenVINOInferResult
 
 
+class _OVBridge(QObject):
+    finished = Signal(object, object)
+
+    def deliver(self, result, error):
+        self.finished.emit(result, error)
+
+
 class OpenVINOService(QObject):
-    completed = Signal(str, str)  # text, effective_device
+    completed = Signal(str, str)
     failed = Signal(str)
     busy_changed = Signal(bool)
 
@@ -13,6 +20,11 @@ class OpenVINOService(QObject):
         super().__init__(parent)
         self._client = client
         self._busy = False
+        self._last_result = None
+
+    @property
+    def last_result(self):
+        return self._last_result
 
     @property
     def is_busy(self):
@@ -24,23 +36,25 @@ class OpenVINOService(QObject):
             return
         self._busy = True
         self.busy_changed.emit(True)
-        bridge = self
+        bridge = _OVBridge(self)
+        bridge.finished.connect(self._on_finished)
         runnable = _OVRunnable(bridge, self._client, model_id, prompt, device, max_tokens)
         QThreadPool.globalInstance().start(runnable)
 
-    def _finish(self, result=None, error=None):
+    def _on_finished(self, result, error):
         self._busy = False
         self.busy_changed.emit(False)
         if error is not None:
             self.failed.emit(str(error))
         else:
+            self._last_result = result
             self.completed.emit(result.text, result.effective_device)
 
 
 class _OVRunnable(QRunnable):
-    def __init__(self, service, client, model_id, prompt, device, max_tokens):
+    def __init__(self, bridge, client, model_id, prompt, device, max_tokens):
         super().__init__()
-        self._service = service
+        self._bridge = bridge
         self._client = client
         self._model_id = model_id
         self._prompt = prompt
@@ -52,9 +66,9 @@ class _OVRunnable(QRunnable):
         try:
             res = self._client.infer(self._model_id, self._prompt, device=self._device, max_tokens=self._max_tokens)
         except OpenVINOClientError as exc:
-            self._service._finish(error=exc.user_message)
+            self._bridge.deliver(None, exc.user_message)
             return
-        except Exception as exc:
-            self._service._finish(error=str(exc))
+        except Exception as exc:  # pragma: no cover - defensive
+            self._bridge.deliver(None, str(exc))
             return
-        self._service._finish(result=res)
+        self._bridge.deliver(res, None)
