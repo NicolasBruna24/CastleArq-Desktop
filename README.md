@@ -262,18 +262,18 @@ Two suites exist, with different purposes:
   cases are skipped unless `CASTLEARQ_RUNTIME_IT=1` is set. That real-Core
   case validates the launch → readiness → shutdown flow and the three
   approved endpoints (`/health`, `/v1/models`, `/v1/artifacts`) against Core
-  `0.5.1` only; it does not cover other Core versions or the rest of Core's
-  API surface.
+  `0.5.1` and a separate case for `0.6.1`; it does not cover other Core
+  versions or the rest of Core's API surface.
 
 
 ## Known limitations
 
-- **DEC-A admits exactly two versions** — production readiness admission is
-  fail-closed (`VersionAdmission.NOT_EVALUATED` as the static input plus
-  conservative per-pass version comparison), so a readiness success state
-  requires a matched version that is explicitly allowlisted. Today those are
-  `0.5.1` and `0.6.0` (see `docs/adr-0005-core-version-admission.md`);
-  every other version — including newer Core releases — stays fail-closed
+- **DEC-A admits three versions** — `0.5.1`, `0.6.0`, and `0.6.1` are
+  listed in `SUPPORTED_CORE_VERSIONS` (see
+  `src/castlearq_desktop/core/version_admission.py`); the allowlist defines
+  the versions admitted for readiness, but does not by itself demonstrate
+  that every listed version has been validated through real-Core integration.
+  Every other version — including newer Core releases — stays fail-closed
   until separately audited against contract requirements and explicitly
   added to the allowlist.
 - No conversation persistence is implemented: chat history lives in the
@@ -291,11 +291,16 @@ Two suites exist, with different purposes:
   cancelled and immediate exit is not guaranteed.
 - Port-conflict detection at startup is not implemented (the error code and
   port constants exist in the contracts only).
-- Integration evidence is limited to Core `0.5.1` — the opt-in runtime suite
-  launches a real, isolated Core `0.5.1` installation through the production
-  path (launch, readiness over `/health`, `/v1/models`, `/v1/artifacts`, and
-  coordinated shutdown), but no other Core version and no further API surface
-  has been exercised against a real installation.
+- Integration evidence exists for Core `0.5.1` and `0.6.1` — the opt-in
+  runtime suite (enabled via `CASTLEARQ_RUNTIME_IT=1`) launches real,
+  isolated Core installations through the production path. A real-Core case
+  for `0.5.1` validates the launch → readiness → shutdown flow across the
+  three approved endpoints (`/health`, `/v1/models`, `/v1/artifacts`) and
+  coordinated shutdown. A separate real-Core case for `0.6.1` exercises the
+  same production path. No other Core version has been exercised against a
+  real installation through this suite. The opt-in nature of the suite and
+  the limited set of exercised endpoints mean no capability across the full
+  Core API surface is validated.
 - The legacy synchronous HTTP readiness engine is retained for compatibility;
   production readiness uses the asynchronous Qt transport.
 
