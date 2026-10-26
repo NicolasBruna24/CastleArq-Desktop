@@ -71,10 +71,36 @@ ABS_PYTHON = "/abs/env/bin/python"
 TEST_VERSION = "9.9.9-test"
 
 
-def _health_body(version: str = TEST_VERSION) -> bytes:
-    """Well-formed /health body whose top-level ``version`` is *version*."""
+def _health_body(version="0.6.1"):
     import json
     return json.dumps({"version": version}).encode()
+
+
+def _probe_transport(health_version: str = TEST_VERSION, status: int = 200):
+    """Transporte determinista de la capa de conexión (``connect_existing``):
+    responde 2xx a todos los endpoints y publica un body de salud con la versión
+    indicada. Se usa para los escenarios de admisión (fallo cerrado, incompatible,
+    admitido) sin tocar el Core real de *127.0.0.1:8000*.
+    """
+    import json
+    from castlearq_desktop.core.readiness_client import HttpProbeResponse
+
+    def transport(path, *, timeout):
+        if path.endswith("/health"):
+            body = json.dumps({"status": "ok", "version": health_version}).encode()
+        else:
+            body = b""
+        return HttpProbeResponse(status=status, body=body)
+
+    return transport
+
+
+class _RefusedTransport:
+    """Transporte de prueba que simula un Core no disponible: cualquier petición
+    eleva ``ConnectionRefusedError``, con lo que ``connect_existing()`` concluye
+    ``CONNECTION_REFUSED`` y el controlador inicia el proceso gestionado. Útil
+    para los escenarios de ciclo de vida y de transparencia de errores."""
+
 
 
 class FakeSettings:
@@ -246,7 +272,9 @@ def qt_app():
 
 
 def build(popen, *, api_contract=VersionAdmission.ADMITTED,
-          admitted_version: Optional[str] = TEST_VERSION):
+          admitted_version: Optional[str] = TEST_VERSION,
+          transport=None, installed_version_provider=None,
+          supported_versions=None):
     """Construct a coordinator + controller wired with two timer registries.
 
     When *admitted_version* is given, DEC-A is driven for real: an
@@ -256,6 +284,12 @@ def build(popen, *, api_contract=VersionAdmission.ADMITTED,
     ``admitted_version=None`` to leave the static ``api_contract`` input in
     force (used by the fail-closed test, which asserts readiness never
     succeeds because admission was not evaluated).
+
+    ``transport`` replaces the default HTTP probing client (``urllib_transport``
+    against *127.0.0.1:8000*) with a deterministic test double, so every
+    startup/shutdown path can be exercised without contacting the real Core.
+    ``installed_version_provider`` and ``supported_versions`` are forwarded to
+    the coordinator to complete the DEC-A admission inputs.
     """
     settings = InterpreterSettingsStore(FakeSettings())
     settings.save(ABS_PYTHON)
@@ -263,20 +297,27 @@ def build(popen, *, api_contract=VersionAdmission.ADMITTED,
     coord_reg: list = []
     ctrl_reg: list = []
     nam = QtFakeNAM()
-    admission_kwargs = {}
+    coordinator_kwargs = {
+        "settings": settings,
+        "clock": clock,
+        "popen_factory": PopenFactory(popen),
+        "timer_factory": lambda: FakeTimer(coord_reg),
+        "validator": valid_outcome,
+        "api_contract": api_contract,
+        "qt_nam": nam,
+        "transport": transport,
+    }
     if admitted_version is not None:
-        admission_kwargs["installed_version_provider"] = lambda: admitted_version
-        admission_kwargs["supported_versions"] = frozenset({admitted_version})
-    coordinator = CoreStartupCoordinator(
-        settings=settings,
-        clock=clock,
-        popen_factory=PopenFactory(popen),
-        timer_factory=lambda: FakeTimer(coord_reg),
-        validator=valid_outcome,
-        api_contract=api_contract,
-        qt_nam=nam,
-        **admission_kwargs,
-    )
+        coordinator_kwargs["installed_version_provider"] = (
+            installed_version_provider
+            if installed_version_provider is not None
+            else lambda: admitted_version
+        )
+        coordinator_kwargs["supported_versions"] = (
+            supported_versions if supported_versions is not None
+            else frozenset({admitted_version})
+        )
+    coordinator = CoreStartupCoordinator(**coordinator_kwargs)
     controller = StartupController(coordinator,
                                    timer_factory=lambda: FakeTimer(ctrl_reg))
     return SimpleNamespace(controller=controller, coordinator=coordinator,
@@ -292,7 +333,7 @@ def fire(reg, ms):
 
 # --- startup -----------------------------------------------------------------
 def test_duplicate_startup_prevented():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     first = b.controller.start()
     assert first is not None
     assert b.coordinator.spawn_calls == 1
@@ -302,7 +343,7 @@ def test_duplicate_startup_prevented():
 
 
 def test_state_and_readiness_signal_propagation():
-    b = build(FakePopen())  # ADMITTED
+    b = build(FakePopen(), transport=_RefusedTransport(), admitted_version="0.6.1")  # ADMITTED
     states, results = [], []
     b.controller.state_changed.connect(lambda s: states.append(s))
     b.controller.readiness_result.connect(lambda r: results.append(r))
@@ -316,7 +357,7 @@ def test_state_and_readiness_signal_propagation():
 
 
 def test_checker_retained_for_attempt():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     checker = b.controller._active_checker
     assert checker is not None
@@ -326,7 +367,7 @@ def test_checker_retained_for_attempt():
 
 
 def test_stale_readiness_result_suppressed():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport(), admitted_version="0.6.1")
     b.controller.start()
     active = b.controller._active_checker
     results = []
@@ -342,21 +383,34 @@ def test_stale_readiness_result_suppressed():
 
 
 def test_fail_closed_when_admission_not_evaluated():
-    b = build(FakePopen(), api_contract=VersionAdmission.NOT_EVALUATED,
-              admitted_version=None)
+    b = build(FakePopen(),
+              api_contract=VersionAdmission.NOT_EVALUATED,
+              admitted_version=None,
+              transport=_probe_transport(health_version="0.6.1"))
     results = []
     b.controller.readiness_result.connect(lambda r: results.append(r))
-    b.controller.start()
-    assert b.coordinator.manager.state is LifecycleState.RUNNING
-    b.clock.advance(20.0)  # reach the global readiness deadline
-    for _, reply in b.nam.requests:
-        reply.succeed(200)
-    # Admission not evaluated -> readiness never succeeds; terminal is a timeout.
-    assert results and all(r.ready is False for r in results)
+    outcome = b.controller.start()
+    # Fail-closed: admission not evaluated -> no manager is created, no process
+    # is launched, and no readiness flow is started. The attempt is reported as
+    # a controlled failure instead of being suppressed.
+    assert outcome is not None
+    assert outcome.status == "failed"
+    assert outcome.state is None
+    assert outcome.error is None
+    assert b.coordinator.manager is None
+    # 3) No se lanza ningún proceso: el mock de la población nunca es
+    #    terminado/kill y, como el manager no se creó, no hay adapter con un
+    #    proceso propio que gestionar.
+    assert b.popen.terminates == 0
+    assert b.popen.kills == 0
+    assert len(b.nam.requests) == 0
+    # Admission not evaluated -> no readiness flow was created, so no readiness
+    # result is produced at all.
+    assert results == []
 
 
 def test_close_while_readiness_pending():
-    b = build(FakePopen())  # ADMITTED
+    b = build(FakePopen(), transport=_RefusedTransport())  # ADMITTED
     shutdown_states = []
     b.controller.shutdown_finished.connect(lambda s: shutdown_states.append(s))
     b.controller.start()
@@ -375,7 +429,7 @@ def test_close_while_readiness_pending():
 
 # --- shutdown ----------------------------------------------------------------
 def test_repeated_shutdown_does_not_reset_deadline():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     b.controller.request_shutdown()
     deadline_timer = b.controller._shutdown_deadline_timer
@@ -388,7 +442,7 @@ def test_repeated_shutdown_does_not_reset_deadline():
 
 
 def test_confirmed_shutdown_reports_stopped():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     states = []
     b.controller.shutdown_finished.connect(lambda s: states.append(s))
@@ -402,7 +456,7 @@ def test_confirmed_shutdown_reports_stopped():
 
 
 def test_unconfirmed_shutdown_reports_failed():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     states = []
     b.controller.shutdown_finished.connect(lambda s: states.append(s))
@@ -414,7 +468,7 @@ def test_unconfirmed_shutdown_reports_failed():
 
 
 def test_no_termination_after_deadline():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     b.controller.request_shutdown()
     fire(b.ctrl_reg, 5000)  # deadline -> SHUTDOWN_FAILED (terminal)
@@ -433,7 +487,7 @@ def test_shutdown_exit_code_mapping():
 
 
 def test_terminal_failure_maps_to_nonzero_exit():
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.controller.start()
     exit_codes = []
     b.controller.shutdown_finished.connect(
@@ -508,6 +562,7 @@ def test_start_failure_displays_error_code_and_message(qt_app):
         validator=valid_outcome,
         api_contract=VersionAdmission.ADMITTED,
         qt_nam=QtFakeNAM(),
+        transport=_RefusedTransport(),
     )
     controller = StartupController(
         coordinator, timer_factory=lambda: FakeTimer(ctrl_reg))
@@ -524,7 +579,7 @@ def test_start_failure_displays_error_code_and_message(qt_app):
 
 def test_start_failure_shows_validation_detail_message(qt_app):
     """A typed validation failure surfaces its code and detail message."""
-    b = build(FakePopen())
+    b = build(FakePopen(), transport=_RefusedTransport())
     b.coordinator.validator = lambda python: ValidationOutcome(
         code=ErrorCode.CORE_NOT_INSTALLED,
         python_version=(3, 12, 0),
