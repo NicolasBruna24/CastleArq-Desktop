@@ -43,6 +43,7 @@ from PySide6.QtWidgets import (
 )
 
 from castlearq_desktop import APP_NAME
+from castlearq_desktop.ui.styles import apply_app_theme, SIDEBAR_WIDTH
 from castlearq_desktop.core.interpreter_settings import (
     InterpreterSettingsStore,
     create_interpreter_settings,
@@ -85,7 +86,8 @@ class MainWindow(QMainWindow):
     ) -> None:
         super().__init__(parent)
         self.setWindowTitle(APP_NAME)
-        self.resize(900, 600)
+        self.resize(1100, 700)
+        apply_app_theme(self)
 
         # Tests inject a fake-backed store; production uses approved QSettings.
         self._interpreter_settings = (
@@ -112,6 +114,7 @@ class MainWindow(QMainWindow):
 
         # Navigation shell: sidebar + stacked pages.
         self._sidebar = QListWidget(self)
+        self._sidebar.setFixedWidth(SIDEBAR_WIDTH)
         self._sidebar.addItems([
             "Inicio",
             "Modelos",
@@ -183,6 +186,9 @@ class MainWindow(QMainWindow):
         splitter = QSplitter(self)
         splitter.addWidget(self._sidebar)
         splitter.addWidget(self._stacked)
+        splitter.setSizes([SIDEBAR_WIDTH, 900])
+        splitter.setStretchFactor(0, 0)
+        splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
 
         self._sidebar.currentRowChanged.connect(self._stacked.setCurrentIndex)
@@ -271,6 +277,16 @@ class MainWindow(QMainWindow):
         if chat_view is not None and hasattr(chat_view, "set_artifact"):
             chat_view.set_artifact(None)
 
+    def _on_open_chat_requested(self, artifact) -> None:
+        """Transfer the selected artifact to Chat and navigate there."""
+        chat_view = getattr(self, "_chat_view", None)
+        if chat_view is not None and hasattr(chat_view, "set_artifact"):
+            chat_view.set_artifact(artifact)
+        index = self._stacked.indexOf(chat_view) if chat_view is not None else -1
+        if index >= 0:
+            self._stacked.setCurrentIndex(index)
+        self._sidebar.setCurrentRow(index if index >= 0 else 0)
+
     def _on_chat_session_closed(self) -> None:
         """React to a chat session that was closed on Core."""
         return
@@ -350,6 +366,10 @@ class MainWindow(QMainWindow):
         explorer = getattr(self, "_model_explorer", None)
         if explorer is not None and hasattr(explorer, "set_local_artifacts"):
             explorer.set_local_artifacts(artifacts)
+        view = getattr(self, "_openvino_view", None)
+        if view is not None and hasattr(view, "set_models"):
+            ids = [a.model_id for a in (artifacts or []) if getattr(a, "backend", None) == "openvino"]
+            view.set_models(ids)
         if self._pending_library_refresh:
             self._pending_library_refresh = False
             service = getattr(self, "_local_library_service", None)
@@ -516,6 +536,9 @@ class MainWindow(QMainWindow):
             self._local_library.artifact_unselected.connect(
                 self._on_artifact_unselected
             )
+            self._local_library.open_chat_requested.connect(
+                self._on_open_chat_requested
+            )
             self._local_library_service.finished.connect(
                 self._on_local_library_finished
             )
@@ -567,14 +590,26 @@ class MainWindow(QMainWindow):
             self._runtime_readiness_error_label.setText("sin información registrada")
 
     def _build_openvino_page(self) -> QWidget:
-        # OpenVINO requires a Core client; until one is wired, keep a
-        # non-blocking placeholder instead of crashing window construction.
-        self._openvino_service = None
-        self._openvino_view = QLabel("Intel / OpenVINO disponible cuando Core esté listo.")
-        return self._openvino_view
+        try:
+            from castlearq_desktop.core.openvino_client import (
+                CoreOpenVINOClient,
+                default_openvino_base_url,
+            )
+            from castlearq_desktop.core.openvino_service import OpenVINOService
+            from castlearq_desktop.ui.openvino_view import OpenVINOView
+        except ImportError:
+            self._openvino_service = None
+            self._openvino_view = QLabel('Intel / OpenVINO no disponible.')
+            return self._openvino_view
+        else:
+            client = CoreOpenVINOClient(default_openvino_base_url())
+            self._openvino_service = OpenVINOService(client, parent=self)
+            self._openvino_view = OpenVINOView(service=self._openvino_service, parent=self)
+            return self._openvino_view
 
     def _on_sidebar_page_changed(self, index: int) -> None:
-        return None
+        if index == 5 and hasattr(self, "_refresh_local_library"):
+            self._refresh_local_library()
 
     def closeEvent(self, event: object) -> None:
         """Route window close through the controller; defer while shutting down.

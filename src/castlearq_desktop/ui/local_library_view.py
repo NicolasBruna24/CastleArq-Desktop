@@ -21,6 +21,7 @@ from PySide6.QtWidgets import (
     QListWidgetItem,
     QPushButton,
     QVBoxLayout,
+    QSizePolicy,
     QWidget,
 )
 
@@ -30,6 +31,7 @@ from castlearq_desktop.core.download_service import (
     StoreInfo,
     StoreState,
 )
+from castlearq_desktop.ui.styles import make_font
 
 _TITLE = "Biblioteca local"
 _IDLE_TEXT = "Sin consultar"
@@ -145,6 +147,7 @@ class LocalLibraryView(QWidget):
 
         self._status = QLabel(_IDLE_TEXT, box)
         self._status.setWordWrap(True)
+        self._status.setFont(make_font(12))
         self._status.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -152,6 +155,7 @@ class LocalLibraryView(QWidget):
 
         self._store_label = QLabel("", box)
         self._store_label.setWordWrap(True)
+        self._store_label.setFont(make_font(12))
         self._store_label.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -164,6 +168,7 @@ class LocalLibraryView(QWidget):
 
         self._detail = QLabel("", box)
         self._detail.setWordWrap(True)
+        self._detail.setFont(make_font(12))
         layout.addWidget(self._detail)
 
         self._button = QPushButton(_REFRESH_TEXT, box)
@@ -175,6 +180,11 @@ class LocalLibraryView(QWidget):
         self._open_chat_button.clicked.connect(self._on_open_chat)
         layout.addWidget(self._open_chat_button)
 
+        outer = QVBoxLayout(self)
+        outer.setContentsMargins(12, 12, 12, 12)
+        outer.setSpacing(8)
+        outer.addWidget(box)
+        self._list.setSizePolicy(QSizePolicy.Policy.Expanding, QSizePolicy.Policy.Expanding)
         self._service.started.connect(self._on_started)
         self._service.finished.connect(self._on_finished)
         self._service.failed.connect(self._on_failed)

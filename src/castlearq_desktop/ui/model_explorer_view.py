@@ -29,6 +29,7 @@ from castlearq_desktop.core.download_service import (
     StoreState,
 )
 from castlearq_desktop.core.model_catalog import ModelEntry
+from castlearq_desktop.ui.styles import COLOR_TEXT_SECONDARY, SPACING_SM, make_font
 
 
 _TITLE = "Model Explorer"
@@ -125,6 +126,7 @@ class ModelExplorerView(QWidget):
 
         self._status = QLabel(_IDLE_TEXT, box)
         self._status.setWordWrap(True)
+        self._status.setFont(make_font(12))
         self._status.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
@@ -136,6 +138,7 @@ class ModelExplorerView(QWidget):
 
         self._detail = QLabel("", box)
         self._detail.setWordWrap(True)
+        self._detail.setFont(make_font(12))
         layout.addWidget(self._detail)
 
         # Separate, always-derived section: the real artifacts Core lists for
@@ -143,6 +146,7 @@ class ModelExplorerView(QWidget):
         # also carries the state of the last acquisition after a download.
         self._local_detail = QLabel("", box)
         self._local_detail.setWordWrap(True)
+        self._local_detail.setFont(make_font(12))
         self._local_detail.setTextInteractionFlags(
             Qt.TextInteractionFlag.TextSelectableByMouse
         )
