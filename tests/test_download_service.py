@@ -561,4 +561,95 @@ def test_parse_artifacts_backend_unexpected():
     assert arts[0].backend is None
 
 
+@pytest.mark.parametrize(
+    ("artifact_format", "expected_backend", "canonical_format"),
+    [
+        ("GGUF", "gguf", "GGUF"),
+        (" gguf ", "gguf", "GGUF"),
+        ("gGuF", "gguf", "GGUF"),
+        ("OpenVINO IR", "openvino", "OpenVINO IR"),
+        (" openvino ir ", "openvino", "OpenVINO IR"),
+        ("OPENVINO IR", "openvino", "OpenVINO IR"),
+    ],
+)
+def test_parse_artifacts_does_not_authorize_backend_from_known_format(
+    artifact_format, expected_backend, canonical_format
+):
+    from castlearq_desktop.core.download_service import parse_artifacts
+
+    document = _list_document(
+        [
+            {
+                "model_id": "m",
+                "filename": "artifact",
+                "backend": None,
+                "format": artifact_format,
+            }
+        ]
+    )
+
+    artifacts, error = parse_artifacts(document)
+
+    assert error is None
+    assert artifacts[0].backend is None
+    assert artifacts[0].format == canonical_format
+
+
+@pytest.mark.parametrize(
+    ("entry", "expected_backend"),
+    [
+        ({"format": "GGUF"}, None),
+        ({"format": "OpenVINO IR"}, None),
+        ({"format": "GGUF", "backend": "gguf"}, "gguf"),
+        ({"format": "OpenVINO IR", "backend": "openvino"}, "openvino"),
+        ({"format": "OpenVINO IR", "backend": "gguf"}, None),
+        ({"format": "GGUF", "backend": "openvino"}, None),
+        ({"format": "Unknown"}, None),
+        ({"format": "GGUF-like"}, None),
+        ({"format": "  "}, None),
+        ({}, None),
+        ({"format": "GGUF", "backend": "unknown"}, None),
+    ],
+)
+def test_parse_artifacts_uses_conservative_backend_resolution(entry, expected_backend):
+    from castlearq_desktop.core.download_service import parse_artifacts
+
+    artifacts, error = parse_artifacts(
+        _list_document(
+            [{"model_id": "m", "filename": "artifact", **entry}]
+        )
+    )
+
+    assert error is None
+    assert artifacts[0].backend == expected_backend
+
+
+def test_parse_artifacts_classifies_the_ten_artifact_core_inventory():
+    from pathlib import Path
+
+    from castlearq_desktop.core.download_service import parse_artifacts
+
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "core_list_with_formats.json"
+    )
+    artifacts, error = parse_artifacts(fixture.read_text(encoding="utf-8"))
+
+    assert error is None
+    assert len(artifacts) == 10
+    document = json.loads(fixture.read_text(encoding="utf-8"))
+    raw_by_identity = {
+        (entry["model_id"], entry["filename"]): entry
+        for entry in document["payload"]["artifacts"]
+    }
+    assert sum(artifact.backend == "gguf" for artifact in artifacts) == 0
+    assert sum(artifact.backend == "openvino" for artifact in artifacts) == 4
+    assert sum(artifact.backend is None for artifact in artifacts) == 6
+    for artifact in artifacts:
+        raw = raw_by_identity[(artifact.model_id, artifact.filename)]
+        assert artifact.backend == raw.get("backend")
+        assert artifact.format == raw.get("format")
+
+
 __all__ = []

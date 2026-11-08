@@ -24,6 +24,8 @@ everything shown comes from the configured interpreter and Core.
 
 from __future__ import annotations
 
+from collections import Counter
+
 import os
 import logging
 
@@ -102,6 +104,10 @@ class MainWindow(QMainWindow):
         self._controller = controller
         self._runtime_readiness_result = None
         self._runtime_readiness_error = None
+        self._last_readiness_ready = False
+        self._confirmed_core_version = None
+        from castlearq_desktop.core.version_admission import capabilities_for_version
+        self._core_capabilities = capabilities_for_version(None)
 
         # Selected catalog model and selected installed artifact are kept
         # apart: they come from two different surfaces of Core.
@@ -191,7 +197,7 @@ class MainWindow(QMainWindow):
         splitter.setStretchFactor(1, 1)
         self.setCentralWidget(splitter)
 
-        self._sidebar.currentRowChanged.connect(self._stacked.setCurrentIndex)
+        self._sidebar.currentRowChanged.connect(self._on_sidebar_page_changed)
         self._sidebar.setCurrentRow(0)
         self._connect_controller()
 
@@ -283,8 +289,17 @@ class MainWindow(QMainWindow):
         if chat_view is not None and hasattr(chat_view, "set_artifact"):
             chat_view.set_artifact(artifact)
         index = self._stacked.indexOf(chat_view) if chat_view is not None else -1
-        if index >= 0:
-            self._stacked.setCurrentIndex(index)
+        self._sidebar.setCurrentRow(index if index >= 0 else 0)
+
+    def _on_open_openvino_requested(self, artifact) -> None:
+        """Transfer the selected artifact's model_id to OpenVINOView and navigate."""
+        view = getattr(self, "_openvino_view", None)
+        if view is not None and hasattr(view, "set_selected_model"):
+            view.set_selected_model(
+                getattr(artifact, "model_id", ""),
+                getattr(artifact, "format", None),
+            )
+        index = self._stacked.indexOf(view) if view is not None else -1
         self._sidebar.setCurrentRow(index if index >= 0 else 0)
 
     def _on_chat_session_closed(self) -> None:
@@ -368,13 +383,38 @@ class MainWindow(QMainWindow):
             explorer.set_local_artifacts(artifacts)
         view = getattr(self, "_openvino_view", None)
         if view is not None and hasattr(view, "set_models"):
-            ids = [a.model_id for a in (artifacts or []) if getattr(a, "backend", None) == "openvino"]
-            view.set_models(ids)
+            openvino_artifacts = [
+                a for a in (artifacts or []) if getattr(a, "backend", None) == "openvino"
+            ]
+            # Core's infer route searches manifests by model_id before checking
+            # the format, so another backend with the same ID can interfere.
+            all_counts = Counter(getattr(a, "model_id", None) for a in (artifacts or []))
+            ids = list(dict.fromkeys(a.model_id for a in openvino_artifacts))
+            ambiguous_ids = {
+                a.model_id for a in openvino_artifacts if all_counts[a.model_id] > 1
+            }
+            formats = {a.model_id: a.format for a in openvino_artifacts}
+            view.set_models(ids, formats, ambiguous_model_ids=ambiguous_ids)
         if self._pending_library_refresh:
             self._pending_library_refresh = False
             service = getattr(self, "_local_library_service", None)
             if service is not None and not service.is_busy:
                 service.refresh()
+
+    def _on_local_library_started(self) -> None:
+        view = getattr(self, "_openvino_view", None)
+        if view is not None and hasattr(view, "set_loading"):
+            view.set_loading()
+
+    def _on_local_library_failed(self, message: str) -> None:
+        view = getattr(self, "_openvino_view", None)
+        if view is not None and hasattr(view, "set_load_error"):
+            view.set_load_error(message)
+        if self._pending_library_refresh:
+            self._pending_library_refresh = False
+            service = getattr(self, "_local_library_service", None)
+            if service is not None and not service.is_busy:
+                self._schedule_library_refresh(service)
 
     # -- Core startup / readiness / shutdown (delegated to the controller) --
     def _connect_controller(self) -> None:
@@ -390,6 +430,7 @@ class MainWindow(QMainWindow):
         """Request a single Core startup through the controller (no-op if none)."""
         if self._controller is None:
             return
+        self._invalidate_core_capabilities(clear_chat_session=True)
         result = self._controller.start()
         self._show_startup_failure(result)
 
@@ -425,14 +466,40 @@ class MainWindow(QMainWindow):
             self._status_label.setText("Core: start failed.")
 
     def _on_state_changed(self, state: object) -> None:
+        self._invalidate_core_capabilities(clear_chat_session=True)
         self._status_label.setText(f"Core: {getattr(state, 'value', state)}")
+
+    def _apply_core_capabilities(self, version: object) -> None:
+        from castlearq_desktop.core.version_admission import capabilities_for_version
+
+        capabilities = capabilities_for_version(
+            version if isinstance(version, str) else None
+        )
+        self._confirmed_core_version = version if capabilities.chat else None
+        self._core_capabilities = capabilities
+        chat_view = getattr(self, "_chat_view", None)
+        if chat_view is not None:
+            chat_view.set_chat_supported(capabilities.chat)
+            chat_view.set_chat_device_supported(capabilities.chat_device)
+        openvino_view = getattr(self, "_openvino_view", None)
+        if openvino_view is not None and hasattr(openvino_view, "set_inference_supported"):
+            openvino_view.set_inference_supported(capabilities.openvino_inference)
+
+    def _invalidate_core_capabilities(self, *, clear_chat_session: bool = False) -> None:
+        """Fail closed immediately while Core lifecycle/readiness is unsettled."""
+        self._last_readiness_ready = False
+        chat_view = getattr(self, "_chat_view", None)
+        if clear_chat_session and chat_view is not None:
+            chat_view.invalidate()
+        self._apply_core_capabilities(None)
+        if self._catalog_controller is not None:
+            self._model_explorer.set_core_ready(False)
 
     def _core_is_ready(self) -> bool:
         """Return True when the last readiness result was positive."""
         return bool(getattr(self, "_last_readiness_ready", False))
 
     def _on_readiness_result(self, result: object) -> None:
-
         _logger.debug(
             "READINESS RESULT ready=%s error_code=%s deadline_expired=%s",
             getattr(result, "ready", None),
@@ -440,16 +507,22 @@ class MainWindow(QMainWindow):
             getattr(result, "deadline_expired", None),
         )
         self._last_readiness_ready = bool(getattr(result, "ready", False))
-        if self._catalog_controller is not None:
-            self._model_explorer.set_core_ready(self._last_readiness_ready)
-        if getattr(result, "ready", False):
-            self._status_label.setText("Core: ready.")
-        else:
+        if not self._last_readiness_ready:
+            self._invalidate_core_capabilities(clear_chat_session=True)
+            if self._catalog_controller is not None:
+                self._model_explorer.set_core_ready(False)
             code = getattr(result, "error_code", None)
             label = getattr(code, "value", code)
             self._status_label.setText(f"Core: not ready ({label}).")
+            return
+        version = getattr(self._controller, "installed_core_version", None)
+        self._apply_core_capabilities(version)
+        if self._catalog_controller is not None:
+            self._model_explorer.set_core_ready(True)
+        self._status_label.setText("Core: ready.")
 
     def _on_readiness_error(self, exc: object) -> None:
+        self._invalidate_core_capabilities(clear_chat_session=True)
         self._status_label.setText(f"Core: readiness error ({exc}).")
 
     def _build_settings_page(self) -> QWidget:
@@ -539,8 +612,17 @@ class MainWindow(QMainWindow):
             self._local_library.open_chat_requested.connect(
                 self._on_open_chat_requested
             )
+            self._local_library.open_openvino_requested.connect(
+                self._on_open_openvino_requested
+            )
             self._local_library_service.finished.connect(
                 self._on_local_library_finished
+            )
+            self._local_library_service.started.connect(
+                self._on_local_library_started
+            )
+            self._local_library_service.failed.connect(
+                self._on_local_library_failed
             )
             return self._local_library
 
@@ -605,11 +687,18 @@ class MainWindow(QMainWindow):
             client = CoreOpenVINOClient(default_openvino_base_url())
             self._openvino_service = OpenVINOService(client, parent=self)
             self._openvino_view = OpenVINOView(service=self._openvino_service, parent=self)
+            self._openvino_view.set_inference_supported(False)
             return self._openvino_view
 
     def _on_sidebar_page_changed(self, index: int) -> None:
-        if index == 5 and hasattr(self, "_refresh_local_library"):
-            self._refresh_local_library()
+        self._stacked.setCurrentIndex(index)
+        if index == 5:
+            view = getattr(self, "_openvino_view", None)
+            if view is not None and hasattr(view, "set_loading"):
+                view.set_loading()
+            service = getattr(self, "_local_library_service", None)
+            if service is not None:
+                self._schedule_library_refresh(service)
 
     def closeEvent(self, event: object) -> None:
         """Route window close through the controller; defer while shutting down.
@@ -619,6 +708,7 @@ class MainWindow(QMainWindow):
         alive while the controller coordinates a non-blocking shutdown. The
         application exits only after the controller emits its terminal outcome.
         """
+        self._invalidate_core_capabilities(clear_chat_session=True)
         controller = self._controller
         updater = getattr(self, "_update_controller", None)
         if updater is not None:
@@ -655,12 +745,6 @@ class MainWindow(QMainWindow):
             try:
                 # Deletes the session on Core so no runtime outlives the window.
                 chat_service.close()
-            except Exception:  # noqa: BLE001 - close must not fail
-                pass
-        chat_view = getattr(self, "_chat_view", None)
-        if chat_view is not None and hasattr(chat_view, "invalidate"):
-            try:
-                chat_view.invalidate()
             except Exception:  # noqa: BLE001 - close must not fail
                 pass
         if controller is not None and not controller.shutdown_complete:

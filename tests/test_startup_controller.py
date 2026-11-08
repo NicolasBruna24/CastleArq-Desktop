@@ -30,6 +30,7 @@ application-level shutdown deadline), so each can be driven deterministically.
 from __future__ import annotations
 
 import os
+import signal
 import sys
 import time
 from types import SimpleNamespace
@@ -69,6 +70,7 @@ ABS_PYTHON = "/abs/env/bin/python"
 
 #: Test-only admitted version used by the Qt readiness doubles (not production).
 TEST_VERSION = "9.9.9-test"
+_FAKE_POPEN_BY_PID = {}
 
 
 def _health_body(version="0.6.1"):
@@ -173,6 +175,8 @@ class FakeTimer:
 
 class FakePopen:
     def __init__(self, exit_code=None, raises=None) -> None:
+        self.pid = 41000 + len(_FAKE_POPEN_BY_PID)
+        _FAKE_POPEN_BY_PID[self.pid] = self
         self._exit_code = exit_code
         self._raises = raises or {}
         self.terminates = 0
@@ -195,6 +199,23 @@ class FakePopen:
 
     def exit(self, code=0) -> None:
         self._exit_code = code
+
+
+@pytest.fixture(autouse=True)
+def _simulate_posix_process_group_signals(monkeypatch):
+    """Deliver mocked group signals to their owning process fake only."""
+    import castlearq_desktop.core.subprocess_adapter as adapter_module
+
+    _FAKE_POPEN_BY_PID.clear()
+
+    def deliver(group_pid, sig):
+        process = _FAKE_POPEN_BY_PID[-group_pid]
+        if sig == signal.SIGTERM:
+            process.terminate()
+        elif sig == signal.SIGKILL:
+            process.kill()
+
+    monkeypatch.setattr(adapter_module.os, "kill", deliver)
 
 
 class PopenFactory:
@@ -425,6 +446,21 @@ def test_close_while_readiness_pending():
     fire(b.coord_reg, 100)  # observer -> observe() -> STOPPED
     fire(b.ctrl_reg, 100)   # tick -> finalize STOPPED
     assert shutdown_states == [LifecycleState.STOPPED]
+
+
+def test_readiness_completion_after_shutdown_is_ignored():
+    b = build(FakePopen(), transport=_RefusedTransport())
+    b.controller.start()
+    checker = b.controller._active_checker
+    assert checker is not None
+    results = []
+    b.controller.readiness_result.connect(results.append)
+
+    b.controller.request_shutdown()
+    b.controller._on_readiness_result(SimpleNamespace(ready=True), checker)
+
+    assert b.controller._active_checker is None
+    assert results == []
 
 
 # --- shutdown ----------------------------------------------------------------

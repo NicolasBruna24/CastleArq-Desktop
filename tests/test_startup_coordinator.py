@@ -116,6 +116,12 @@ class FakePopen:
             raise action
         return self._exit_code
 
+    def is_alive(self):
+        action = self._raises.get("is_alive")
+        if action is not None:
+            raise action
+        return self._exit_code is None
+
     def is_alive_probe(self):
         return self._exit_code is None
 
@@ -358,14 +364,273 @@ def test_urllib_limitation_stays_documented():
     assert "CANNOT" in src and "preempt" in src
 
 
-def test_unconfigured_interpreter_not_launched():
+def test_no_usable_interpreter_not_launched():
     settings = InterpreterSettingsStore(FakeSettings())
-    coord = CoreStartupCoordinator(settings=settings, clock=FakeClock(),
-                                   timer_factory=FakeTimer,
-                                   validator=lambda p: valid_outcome(p))
+    coord = CoreStartupCoordinator(
+        settings=settings,
+        clock=FakeClock(),
+        timer_factory=FakeTimer,
+        validator=lambda p: valid_outcome(p),
+        managed_environment_provider=lambda: None,
+    )
     res = coord.launch()
     assert res.status == "failed"
     assert coord.spawn_calls == 0
+
+
+def test_default_discovery_once_and_readiness_reuses_valid_result(monkeypatch):
+    from pathlib import Path
+    from castlearq_desktop.core.managed_environment import (
+        ManagedEnvironmentResult, ManagedEnvironmentStatus,
+    )
+    import castlearq_desktop.core.startup_coordinator as startup
+
+    managed = ManagedEnvironmentResult(
+        Path("/managed"), Path("/managed/bin/python"),
+        ManagedEnvironmentStatus.VALID, TEST_VERSION, "ok")
+    calls = []
+    monkeypatch.setattr(startup, "discover_managed_environment",
+                        lambda: calls.append(1) or managed)
+    coord, _ = make_coordinator(AlivePopen(), installed_version_provider=None)
+    coord.launch()
+    coord.transport = make_transport({})
+    result = coord.check_readiness_once(now=0.0)
+    assert len(calls) == 1
+    assert coord._launch_managed_result is managed
+    assert result.ready is True
+
+
+def test_injected_discovery_once_none_reused_and_new_launch_invalidates():
+    calls = []
+    def provider():
+        calls.append(len(calls))
+        if len(calls) == 1:
+            return None
+        raise RuntimeError("discovery failed")
+    coord, _ = make_coordinator(AlivePopen(),
+                                managed_environment_provider=provider,
+                                installed_version_provider=None)
+    coord.launch()
+    assert calls == [0]
+    assert coord._launch_managed_result is None
+    coord._installed_version()
+    assert calls == [0]
+    try:
+        coord.launch()
+    except RuntimeError:
+        pass
+    else:
+        assert False, "launch should propagate discovery exceptions"
+    assert coord._launch_managed_result is startup_unset()
+
+
+def test_valid_managed_environment_selects_and_validates_its_python():
+    from pathlib import Path
+    from types import SimpleNamespace
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    managed_python = Path("/managed/bin/python")
+    validated = []
+    started = []
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save(ABS_PYTHON)
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(),
+        managed_environment_provider=lambda: SimpleNamespace(
+            status=ManagedEnvironmentStatus.VALID,
+            python_path=managed_python,
+            detected_version=TEST_VERSION),
+        validator=lambda python: validated.append(python) or valid_outcome(python),
+    )
+
+    class Manager:
+        def start(self, python):
+            started.append(python)
+            return SimpleNamespace(state=LifecycleState.NOT_STARTED)
+
+    coord.manager = Manager()
+    coord.launch()
+    assert validated == [str(managed_python)]
+    assert started == [str(managed_python)]
+
+
+@pytest.mark.parametrize("status", [
+    "MISSING", "CORE_NOT_INSTALLED",
+])
+def test_managed_fallback_states_launch_manual_python(status):
+    from types import SimpleNamespace
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    manual_python = "/manual/python"
+    validated, started = [], []
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save(manual_python)
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(),
+        managed_environment_provider=lambda: SimpleNamespace(
+            status=getattr(ManagedEnvironmentStatus, status),
+            python_path=None, detected_version=None),
+        validator=lambda python: validated.append(python) or valid_outcome(python),
+    )
+
+    class Manager:
+        def start(self, python):
+            started.append(python)
+            return SimpleNamespace(state=LifecycleState.NOT_STARTED)
+
+    coord.manager = Manager()
+    coord.launch()
+    assert validated == [manual_python]
+    assert started == [manual_python]
+
+
+@pytest.mark.parametrize("status", [
+    "PYTHON_NOT_EXECUTABLE", "PYTHON_INVALID", "VERSION_INCOMPATIBLE",
+])
+def test_invalid_managed_states_block_manual_fallback(status):
+    from types import SimpleNamespace
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save("/manual/python")
+    validated, started = [], []
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(),
+        managed_environment_provider=lambda: SimpleNamespace(
+            status=getattr(ManagedEnvironmentStatus, status),
+            python_path="/managed/python", detected_version=None),
+        validator=lambda python: validated.append(python) or valid_outcome(python),
+    )
+
+    class Manager:
+        def start(self, python):
+            started.append(python)
+            return SimpleNamespace(state=LifecycleState.RUNNING)
+
+    coord.manager = Manager()
+    result = coord.launch()
+    assert result.status == "failed"
+    assert validated == []
+    assert started == []
+
+
+def test_launch_invalidates_attempt_state_before_discovery_exception():
+    coord, _ = make_coordinator(AlivePopen(),
+                                managed_environment_provider=lambda: None)
+    coord._launch_managed_result = object()
+    coord._launch_python = "/old/python"
+    coord._version_cache_valid = True
+    coord._cached_installed_version = "old-version"
+    coord._version_generation = 7
+    coord._version_probe_launched = True
+    coord.managed_environment_provider = lambda: (_ for _ in ()).throw(
+        RuntimeError("discovery failed"))
+    with pytest.raises(RuntimeError, match="discovery failed"):
+        coord.launch()
+    assert coord._launch_managed_result is startup_unset()
+    assert coord._launch_python is None
+    assert coord._version_cache_valid is False
+    assert coord._cached_installed_version is None
+    assert coord._version_generation == 8
+    assert coord._version_probe_launched is False
+
+
+def test_early_launch_failure_still_invalidates_previous_attempt_state():
+    from types import SimpleNamespace
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    settings = InterpreterSettingsStore(FakeSettings())
+    calls = []
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(),
+        managed_environment_provider=lambda: calls.append(1) or SimpleNamespace(
+            status=ManagedEnvironmentStatus.MISSING,
+            python_path=None, detected_version=None),
+    )
+    coord._launch_managed_result = object()
+    coord._version_cache_valid = True
+    coord._cached_installed_version = "old-version"
+    coord._version_generation = 3
+    coord._version_probe_launched = True
+    result = coord.launch()
+    assert result.status == "failed"
+    assert calls == [1]
+    assert coord._launch_managed_result.status is ManagedEnvironmentStatus.MISSING
+    assert coord._version_cache_valid is False
+    assert coord._cached_installed_version is None
+    assert coord._version_generation == 4
+    assert coord._version_probe_launched is False
+
+
+def test_invalid_manual_interpreter_does_not_preserve_previous_attempt():
+    from types import SimpleNamespace
+    from castlearq_desktop.core.contracts.interpreter import ValidationOutcome
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save("/manual/bad-python")
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(),
+        managed_environment_provider=lambda: SimpleNamespace(
+            status=ManagedEnvironmentStatus.MISSING,
+            python_path=None, detected_version=None),
+        validator=lambda python: ValidationOutcome(
+            code=ErrorCode.INTERPRETER_INVALID, detail="invalid"),
+    )
+    coord._launch_managed_result = object()
+    coord._version_cache_valid = True
+    coord._cached_installed_version = "old-version"
+    coord._version_generation = 2
+    coord._version_probe_launched = True
+    result = coord.launch()
+    assert result.status == "failed"
+    assert coord._launch_managed_result.status is ManagedEnvironmentStatus.MISSING
+    assert coord._version_cache_valid is False
+    assert coord._cached_installed_version is None
+    assert coord._version_generation == 3
+    assert coord._version_probe_launched is False
+
+
+def test_probe_pool_uses_selected_managed_interpreter():
+    from pathlib import Path
+    from types import SimpleNamespace
+    from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+
+    managed_python = Path("/managed/bin/python")
+    settings = InterpreterSettingsStore(FakeSettings())
+    settings.save(ABS_PYTHON)
+    coord = CoreStartupCoordinator(
+        settings=settings, clock=FakeClock(), probe_pool=object(),
+        managed_environment_provider=lambda: SimpleNamespace(
+            status=ManagedEnvironmentStatus.VALID,
+            python_path=managed_python, detected_version=TEST_VERSION),
+        validator=lambda python: valid_outcome(python),
+    )
+    coord.manager = SimpleNamespace(start=lambda python: SimpleNamespace(
+        state=LifecycleState.NOT_STARTED))
+    probed = []
+    coord._launch_version_probe = lambda python: probed.append(python)
+    coord.launch()
+    assert coord._installed_version() is None
+    assert probed == [str(managed_python)]
+
+
+def test_version_probe_result_from_retired_generation_is_ignored():
+    coord, _ = make_coordinator(AlivePopen())
+    coord._version_generation = 9
+    coord._cached_installed_version = None
+    coord._version_cache_valid = False
+    coord.invalidate_version_probe()
+
+    coord._on_version_delivered((9, TEST_VERSION))
+
+    assert coord._cached_installed_version is None
+    assert coord._version_cache_valid is False
+
+
+def startup_unset():
+    from castlearq_desktop.core.startup_coordinator import _UNSET
+    return _UNSET
 
 
 class ExitedPopen(FakePopen):

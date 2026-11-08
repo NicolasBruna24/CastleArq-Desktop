@@ -1,0 +1,143 @@
+{
+  "command": "list",
+  "error": null,
+  "exit_code": 0,
+  "payload": {
+    "artifacts": [
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "OpenVINO/Qwen2.5-Coder-7B-Instruct-int4-ov",
+        "format": "OpenVINO IR",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "INT4"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "TinyLlama/TinyLlama-1.1B-Chat-v1.0",
+        "format": "OpenVINO IR",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "FP16"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "qwen2.5-coder-7b-instruct-q2_k.gguf",
+        "model_id": "qwen2.5-coder-7b-instruct",
+        "format": "GGUF",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "Q2_K"
+        },
+        "size_bytes": 3015940032,
+        "status": "verified"
+      },
+      {
+        "filename": "qwen2.5-coder-7b-instruct-q3_k_m.gguf",
+        "model_id": "qwen2.5-coder-7b-instruct",
+        "format": "GGUF",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "Q3_K_M"
+        },
+        "size_bytes": 3808391104,
+        "status": "verified"
+      },
+      {
+        "filename": "qwen2.5-coder-7b-instruct-q4_k_m.gguf",
+        "model_id": "qwen2.5-coder-7b-instruct",
+        "format": "GGUF",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "Q4_K_M"
+        },
+        "size_bytes": 4683073536,
+        "status": "verified"
+      },
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "qwen3-8b-int4",
+        "format": "OpenVINO IR",
+        "backend": "openvino",
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "INT4"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "qwen3-8b-int4-ov",
+        "format": "OpenVINO IR",
+        "backend": "openvino",
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "INT4"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "qwen3-8b-ov-import-test",
+        "format": "OpenVINO IR",
+        "backend": "openvino",
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "INT4"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "openvino_model.xml",
+        "model_id": "qwen3-coder-30b-a3b-instruct",
+        "format": "OpenVINO IR",
+        "backend": "openvino",
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "INT4"
+        },
+        "size_bytes": null,
+        "status": "downloaded"
+      },
+      {
+        "filename": "tinyllama-1.1b-chat-v1.0.Q4_K_M.gguf",
+        "model_id": "thebloke-tinyllama-1-1b-chat-v1-0-gguf-2feea3bcf265",
+        "format": "GGUF",
+        "backend": null,
+        "problem": null,
+        "quantization": {
+          "status": "known",
+          "value": "Q4_K_M"
+        },
+        "size_bytes": 668788096,
+        "status": "verified"
+      }
+    ],
+    "invalid_artifacts": []
+  },
+  "schema": "castlearq.cli",
+  "schema_version": 1,
+  "warnings": []
+}

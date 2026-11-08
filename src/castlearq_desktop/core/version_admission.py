@@ -9,6 +9,7 @@ from __future__ import annotations
 import json
 import os
 import subprocess
+from dataclasses import dataclass
 from typing import Any, Callable, FrozenSet, Mapping, Optional, Tuple
 
 from castlearq_desktop.core.contracts.interpreter import (
@@ -22,6 +23,28 @@ from castlearq_desktop.core.contracts.readiness import VersionAdmission
 #: 0.5.1 installation (the really-installed version equals the real
 #: ``/health`` version and readiness succeeds).
 SUPPORTED_CORE_VERSIONS: FrozenSet[str] = frozenset({"0.5.1", "0.6.0", "0.6.1"})
+
+
+@dataclass(frozen=True)
+class CoreCapabilities:
+    """Small UI capability set, separate from startup version admission."""
+
+    chat: bool = False
+    chat_device: bool = False
+    openvino_inference: bool = False
+
+
+def capabilities_for_version(version: Optional[str]) -> CoreCapabilities:
+    """Return only capabilities established for an admitted Core version."""
+    if version not in SUPPORTED_CORE_VERSIONS:
+        return CoreCapabilities()
+    return CoreCapabilities(
+        chat=True,
+        chat_device=version == "0.6.1",
+        # None of the admitted versions supplies the complete integrated
+        # inference contract required by Desktop's OpenVINO view.
+        openvino_inference=False,
+    )
 
 #: Version covered by the current DEC-A admission decision: ``0.5.1`` is
 #: explicitly admitted (see ``SUPPORTED_CORE_VERSIONS``).

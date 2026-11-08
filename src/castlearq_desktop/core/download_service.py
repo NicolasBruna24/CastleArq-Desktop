@@ -40,6 +40,7 @@ Result verification (public boundary, no invention):
 
 from __future__ import annotations
 
+import logging
 import json
 import os
 import subprocess
@@ -57,6 +58,7 @@ __all__ = [
     "Request",
     "StoreState",
     "LocalArtifact",
+    "is_chat_compatible_backend",
     "StoreInfo",
     "ModelAcquisitionService",
     "LocalLibraryService",
@@ -70,6 +72,9 @@ __all__ = [
     "read_quantization",
     "read_store_state",
 ]
+
+
+_logger = logging.getLogger(__name__)
 
 
 class AcquisitionStatus(str, Enum):
@@ -373,12 +378,14 @@ class LocalArtifact:
     Every field is something Core itself reported in ``list --json``:
     ``model_id`` and ``filename`` identify the artifact, ``quantization``
     and ``size_bytes`` describe it, ``state`` is Core's own state and
-    ``problem`` is Core's own diagnostic. Nothing is inferred.
+    ``problem`` is Core's own diagnostic. ``backend`` is retained only when
+    Core explicitly reports a supported backend; format never authorizes one.
     """
 
     model_id: str
     filename: str
     backend: Optional[str] = None
+    format: Optional[str] = None
     quantization: Optional[str] = None
     size_bytes: Optional[int] = None
     state: Optional[StoreState] = None
@@ -393,6 +400,33 @@ class LocalArtifact:
     def is_present(self) -> bool:
         """Whether Core reports the artifact as downloaded or verified."""
         return self.state in (StoreState.DOWNLOADED, StoreState.VERIFIED)
+
+
+def is_chat_compatible_backend(backend: Optional[str]) -> bool:
+    """Whether Desktop's chat supports an artifact reported by Core."""
+    return backend in ("gguf", "openvino")
+
+
+def _normalize_artifact_format(value: Any) -> Optional[str]:
+    """Canonicalize known Core artifact formats without guessing unknown ones."""
+    if not isinstance(value, str) or not value.strip():
+        return None
+    normalized = value.strip()
+    known_formats = {
+        "gguf": "GGUF",
+        "openvino ir": "OpenVINO IR",
+    }
+    return known_formats.get(normalized.casefold(), normalized)
+
+
+def _reported_artifact_backend(backend: Any, artifact_format: Optional[str]) -> Optional[str]:
+    """Return only an explicitly reported, recognized, consistent backend."""
+    if backend not in ("gguf", "openvino"):
+        return None
+    format_backend = {"GGUF": "gguf", "OpenVINO IR": "openvino"}.get(artifact_format)
+    if format_backend is not None and format_backend != backend:
+        return None
+    return backend
 
 
 def parse_artifacts(text: str) -> tuple[list[LocalArtifact], Optional[str]]:
@@ -428,16 +462,14 @@ def parse_artifacts(text: str) -> tuple[list[LocalArtifact], Optional[str]]:
             problem = entry.get("problem")
             if not isinstance(problem, str) or not problem:
                 problem = None
-            backend = entry.get("backend")
-            if backend in ("gguf", "openvino"):
-                pass
-            else:
-                backend = None
+            fmt = _normalize_artifact_format(entry.get("format"))
+            backend = _reported_artifact_backend(entry.get("backend"), fmt)
             artifacts.append(
                 LocalArtifact(
                     model_id=model_id,
                     filename=filename,
                     backend=backend,
+                    format=fmt,
                     quantization=read_quantization(entry),
                     size_bytes=size_bytes,
                     state=read_store_state(entry),
@@ -905,16 +937,23 @@ class LocalLibraryService(QObject):
 
     def refresh(self) -> bool:
         """Start one library query. Returns False while another one is active."""
+        _logger.debug("LocalLibraryService.refresh: entered is_busy=%s shutting_down=%s",
+                     self._active_generation > 0, self._shutting_down)
         if self._active_generation > 0:
+            _logger.debug("LocalLibraryService.refresh: busy, returning False")
             return False
         if self._shutting_down:
+            _logger.debug("LocalLibraryService.refresh: shutting down, returning False")
             return False
         try:
             python = self._selected_interpreter()
         except Exception as exc:  # noqa: BLE001
+            _logger.debug("LocalLibraryService.refresh: interpreter selection failed: %s", exc)
             self.failed.emit(str(exc) or "No interpreter configured.")
             return False
+        _logger.debug("LocalLibraryService.refresh: interpreter=%s", python)
         if not isinstance(python, str) or not python.strip() or not os.path.isabs(python):
+            _logger.debug("LocalLibraryService.refresh: invalid interpreter path")
             self.failed.emit(
                 "The interpreter must be an absolute path; no PATH lookup is performed."
             )
@@ -997,12 +1036,14 @@ class _LibraryBridge(QObject):
 
     def deliver(self, payload: Any) -> None:
         """Hand a finished result back to the service's thread."""
+        _logger.debug("_LibraryBridge.deliver: emitting resolved")
         self.resolved.emit(payload)
 
     def announce_started(self) -> None:
         self.started.emit()
 
     def report_failure(self, message: str) -> None:
+        _logger.debug("_LibraryBridge.report_failure: %s", message)
         self.failed.emit(message)
 
 
@@ -1026,27 +1067,32 @@ class _LibraryRunnable(QRunnable):
         self.setAutoDelete(True)
 
     def run(self) -> None:
+        _logger.debug("_LibraryRunnable.run: started")
         self._bridge.announce_started()
         try:
             artifacts, store, error = self._execute()
         except Exception as exc:  # noqa: BLE001
+            _logger.debug("_LibraryRunnable.run: exception %s", exc)
             self._bridge.report_failure(
                 f"No se pudo consultar la biblioteca local: {exc}"
             )
             return
+        _logger.debug("_LibraryRunnable.run: finished artifacts=%s error=%s",
+                     len(artifacts) if artifacts is not None else None, error)
         self._bridge.deliver((self._generation, artifacts, store, error))
 
     def _execute(
         self,
     ) -> tuple[list[LocalArtifact], Optional[StoreInfo], Optional[str]]:
+        _logger.debug("_LibraryRunnable._execute: entered")
         artifacts, error = self._query(build_list_argv(self._interpreter))
         if error is not None:
+            _logger.debug("_LibraryRunnable._execute: query error=%s", error)
             return [], None, error
-        # The store path is informative only: a failure here must not hide the
-        # artifacts that were read successfully.
         store, store_error = self._query_store()
         if store_error is not None:
             store = None
+        _logger.debug("_LibraryRunnable._execute: artifacts=%s", len(artifacts))
         return artifacts, store, None
 
     def _query_store(self) -> tuple[Optional[StoreInfo], Optional[str]]:

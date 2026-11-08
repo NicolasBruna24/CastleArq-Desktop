@@ -16,10 +16,12 @@
 
 """CastleArq Desktop application package.
 
-Phase 1 provides only a minimal PySide6 application shell. Core integration
-(HTTP communication, Core process management, and conversation persistence) is
-intentionally not implemented yet; the corresponding modules define boundaries
-only.
+The application provides Core process lifecycle and readiness management,
+model catalog and artifact views, and chat against an admitted Core version.
+Experimental managed-installation and OpenVINO-conversion services are also
+included but are not connected to the standard UI flow. Conversation storage
+is implemented separately and is not injected by the normal MainWindow
+composition.
 """
 
 from __future__ import annotations

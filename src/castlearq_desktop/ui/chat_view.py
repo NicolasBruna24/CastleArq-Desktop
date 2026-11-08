@@ -48,14 +48,29 @@ from PySide6.QtWidgets import (
 )
 
 from castlearq_desktop.core.chat_service import ChatService
+from castlearq_desktop.core.think_parser import split_think_output
 from castlearq_desktop.storage.conversation_store import ConversationStore, ConversationStoreError
-from castlearq_desktop.core.download_service import LocalArtifact
+from castlearq_desktop.core.download_service import (
+    LocalArtifact,
+    is_chat_compatible_backend,
+)
 
 __all__ = ["ChatView"]
+
+
+def _artifact_backend(artifact: object) -> Optional[str]:
+    value = getattr(artifact, "backend", None)
+    return value if isinstance(value, str) else None
+
+
+def _is_chat_compatible(artifact: object) -> bool:
+    return is_chat_compatible_backend(_artifact_backend(artifact))
 
 _TITLE = "Chat"
 _IDLE_TEXT = "Sin sesión de chat abierta."
 _OPENING_TEXT = "Abriendo la sesión de chat en el Core…"
+_GENERATING_TEXT = "Generando respuesta…"
+_CLOSING_TEXT = "Cerrando la sesión de chat…"
 _NO_ARTIFACT_TEXT = "Selecciona un artefacto local para iniciar el chat."
 _START_TEXT = "Iniciar chat"
 _SEND_TEXT = "Enviar"
@@ -78,6 +93,8 @@ class ChatView(QWidget):
         self._service = service
         self._store = store
         self._artifact: Optional[LocalArtifact] = None
+        self._chat_supported = False
+        self._chat_device_supported = False
         self._session_id: Optional[str] = None
         self._conversation_id: Optional[str] = None
         self._messages: list[dict] = []
@@ -152,6 +169,10 @@ class ChatView(QWidget):
 
         self._service.session_opened.connect(self._on_session_opened)
         self._service.turn_completed.connect(self._on_turn_completed)
+        if hasattr(self._service, "open_session_refused"):
+            self._service.open_session_refused.connect(
+                self._on_open_session_refused
+            )
         self._service.failed.connect(self._on_failed)
         self._service.busy_changed.connect(self._on_busy_changed)
 
@@ -176,16 +197,12 @@ class ChatView(QWidget):
                 self._artifact.model_id == artifact.model_id
                 and self._artifact.filename == artifact.filename
                 and self._artifact.quantization == artifact.quantization
+                and _artifact_backend(self._artifact) == _artifact_backend(artifact)
             ):
                 return
         if artifact is None and self._artifact is None:
             return
         self._artifact = artifact
-        is_ov = artifact is not None and getattr(artifact, "backend", None) == "openvino"
-        self._device_combo.setVisible(is_ov)
-        self._device_label.setVisible(is_ov)
-        if is_ov:
-            self._device_combo.setCurrentText("CPU")
 
         self._awaiting_turn = False
         self._last_prompt = None
@@ -195,10 +212,30 @@ class ChatView(QWidget):
             self.close_session()
         if artifact is None:
             self._status.setText(_NO_ARTIFACT_TEXT)
+        elif not _is_chat_compatible(artifact):
+            backend = _artifact_backend(artifact)
+            if backend is None:
+                self._status.setText(
+                    "Backend desconocido. No se puede iniciar Chat."
+                )
+            else:
+                self._status.setText(
+                    f"Backend no compatible con Chat: {backend}."
+                )
         else:
             self._status.setText(
                 f"Artefacto para el chat: {artifact.filename} ({artifact.model_id})"
             )
+        self._update_controls()
+
+    def set_chat_device_supported(self, supported: bool) -> None:
+        """Set whether the confirmed Core version accepts Chat's device field."""
+        self._chat_device_supported = supported is True
+        self._update_controls()
+
+    def set_chat_supported(self, supported: bool) -> None:
+        """Set whether the confirmed Core version exposes the Chat routes."""
+        self._chat_supported = supported is True
         self._update_controls()
 
     # -- actions ------------------------------------------------------------
@@ -209,17 +246,22 @@ class ChatView(QWidget):
         if artifact is None:
             self._status.setText(_NO_ARTIFACT_TEXT)
             return
+        backend = _artifact_backend(artifact)
+        if backend is None:
+            self._status.setText("Backend desconocido. No se puede iniciar Chat.")
+            self._update_controls()
+            return
+        if not _is_chat_compatible(artifact):
+            self._status.setText("Backend no compatible. No se puede iniciar Chat.")
+            self._update_controls()
+            return
         accepted = self._service.open_session(
             artifact.model_id,
             filename=artifact.filename,
             quantization=artifact.quantization,
-            device=self._device_combo.currentText() if getattr(artifact, "backend", None) == "openvino" else None,
-
+            device=self._device_for_artifact(artifact),
         )
         if not accepted:
-            # Refused (busy, duplicate open, missing model): the visible
-            # conversation and the status stay untouched; only the
-            # controls are refreshed from the real state of the service.
             self._update_controls()
             return
         self._history.clear()
@@ -253,6 +295,7 @@ class ChatView(QWidget):
         self._append(f"Tú: {prompt}")
         self._awaiting_turn = True
         self._last_prompt = prompt
+        self._status.setText(_GENERATING_TEXT)
 
     def _on_close(self) -> None:
         """Close the session on Core and drop the visible history."""
@@ -260,7 +303,7 @@ class ChatView(QWidget):
 
     def close_session(self) -> None:
         """Close the Core session (if any) and reset the view."""
-        self._service.close_session()
+        closing = self._service.close_session()
         self._session_id = None
         self._awaiting_turn = False
         self._last_prompt = None
@@ -268,7 +311,9 @@ class ChatView(QWidget):
         self._prompt.clear()
         self._prompt.setEnabled(False)
         artifact = self._artifact
-        if artifact is None:
+        if closing:
+            self._status.setText(_CLOSING_TEXT)
+        elif artifact is None:
             self._status.setText(_NO_ARTIFACT_TEXT)
         else:
             self._status.setText(
@@ -428,6 +473,10 @@ class ChatView(QWidget):
         if artifact is None:
             self._status.setText(_NO_ARTIFACT_TEXT)
             return
+        if not _is_chat_compatible(artifact):
+            self._status.setText("Este artefacto no es compatible con Chat.")
+            self._update_controls()
+            return
         from PySide6.QtWidgets import QDialog, QVBoxLayout, QLabel, QTextEdit, QPushButton, QHBoxLayout
         dlg = QDialog(self)
         dlg.setWindowTitle("Crear continuación")
@@ -452,7 +501,12 @@ class ChatView(QWidget):
         self._continue_button.setEnabled(False)
         self._history.setPlainText(self._saved_history)
         self._status.setText(self._saved_status)
-        accepted = self._service.open_session(artifact.model_id, filename=artifact.filename, quantization=artifact.quantization)
+        accepted = self._service.open_session(
+            artifact.model_id,
+            filename=artifact.filename,
+            quantization=artifact.quantization,
+            device=self._device_for_artifact(artifact),
+        )
         if not accepted:
             self._pending_summary = None
             self._status.setText("No se pudo abrir la sesión.")
@@ -492,9 +546,17 @@ class ChatView(QWidget):
             )
             assistant_text = ""
         else:
-            self._append(f"Core ({turn_count}): {response}")
-            self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
-            assistant_text = response
+            split = split_think_output(response)
+            assistant_text = split.final_text
+            if assistant_text.strip() == "":
+                self._append(f"Core ({turn_count}): (sin contenido)")
+                self._status.setText(
+                    f"Respuesta recibida sin contenido ({turn_count} turno(s))."
+                )
+                assistant_text = ""
+            else:
+                self._append(f"Core ({turn_count}): {assistant_text}")
+                self._status.setText(f"Respuesta recibida ({turn_count} turno(s)).")
         self._messages.append({"role": "assistant", "content": assistant_text})
         if self._store is not None and self._conversation_id is not None:
             try:
@@ -519,22 +581,59 @@ class ChatView(QWidget):
         self._status.setText(message)
         self._update_controls()
 
+    def _on_open_session_refused(self, message: str) -> None:
+        self._status.setText(message)
+        self._update_controls()
+
     def _on_busy_changed(self, busy: bool) -> None:
         self._update_controls(busy=busy)
+        if not busy and self._status.text() == _CLOSING_TEXT:
+            self._set_artifact_status()
 
     # -- internals ----------------------------------------------------------
 
     def _append(self, text: str) -> None:
         self._history.append(text)
 
+    def _set_artifact_status(self) -> None:
+        artifact = self._artifact
+        if artifact is None:
+            self._status.setText(_NO_ARTIFACT_TEXT)
+        else:
+            self._status.setText(
+                f"Artefacto para el chat: {artifact.filename} ({artifact.model_id})"
+            )
+
+    def _device_for_artifact(self, artifact: LocalArtifact) -> Optional[str]:
+        if self._chat_device_supported and _artifact_backend(artifact) == "openvino":
+            return self._device_combo.currentText()
+        return None
+
     def _update_controls(self, busy: Optional[bool] = None) -> None:
         """Refresh the enabled state of the chat controls."""
         if busy is None:
             busy = self._service.is_busy
         has_session = self._session_id is not None
-        self._start_button.setEnabled(
-            not busy and not has_session and self._artifact is not None
+        compatible = (
+            self._chat_supported and self._artifact is not None
+            and _is_chat_compatible(self._artifact)
         )
-        self._send_button.setEnabled(not busy and has_session)
+        is_openvino = (
+            self._chat_device_supported
+            and
+            self._artifact is not None
+            and _artifact_backend(self._artifact) == "openvino"
+        )
+        self._device_label.setVisible(is_openvino)
+        self._device_combo.setVisible(is_openvino)
+        self._device_combo.setEnabled(not busy and not has_session)
+        self._start_button.setEnabled(
+            not busy and not has_session and compatible
+        )
+        self._send_button.setEnabled(
+            not busy and has_session and self._chat_supported
+        )
         self._close_button.setEnabled(not busy and has_session)
-        self._prompt.setEnabled(not busy and has_session)
+        self._prompt.setEnabled(
+            not busy and has_session and self._chat_supported
+        )

@@ -118,6 +118,34 @@ def test_create_session_omits_absent_selectors() -> None:
     assert transport.calls[0]["body"] == {"model_id": "m"}
 
 
+def test_create_openvino_session_posts_the_requested_device() -> None:
+    transport = RecordingTransport(
+        [
+            (
+                201,
+                _json(
+                    {
+                        "session_id": SESSION_ID,
+                        "model_id": "openvino-model",
+                        "status": "ready",
+                    }
+                ),
+            )
+        ]
+    )
+    client = CoreChatClient("http://127.0.0.1:8000", transport=transport)
+
+    client.create_session(
+        "openvino-model", filename="model.xml", device="GPU"
+    )
+
+    assert transport.calls[0]["body"] == {
+        "model_id": "openvino-model",
+        "filename": "model.xml",
+        "device": "GPU",
+    }
+
+
 def test_create_session_requires_a_model() -> None:
     client = CoreChatClient(
         "http://127.0.0.1:8000", transport=RecordingTransport([])

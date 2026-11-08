@@ -1,4 +1,4 @@
-# CastleArq Desktop — Experimental Preview 0.1.0
+# CastleArq Desktop 0.1.1 — Experimental Preview
 
 CastleArq Desktop is a Linux-first PySide6 desktop application for working
 with CastleArq Core models locally: it lets the user select an explicit
@@ -8,7 +8,9 @@ library, and hold real chat sessions against a running Core.
 
 ## Current capabilities
 
-Implemented and covered by automated tests:
+The following features are implemented. Their verification levels differ:
+unit tests with mocks do not establish compatibility with every Core version,
+model, or hardware configuration.
 
 - **Interpreter configuration** — an explicit absolute path selected by the
   user and persisted via `QSettings` under the approved settings key. No
@@ -54,6 +56,29 @@ Implemented and covered by automated tests:
   and close the session explicitly, by changing artifact, or by closing the
   window (which deletes the Core session). Transport, HTTP and Core errors
   are reported with actionable messages.
+- **Managed Core environment (experimental service)** — modules are available
+  to discover, acquire, install, and validate an isolated Core environment.
+  This workflow is not connected to the normal application UI; the standard
+  startup flow still uses the interpreter explicitly selected by the user.
+- **OpenVINO conversion service (experimental)** — a separate asynchronous
+  service can request a conversion and verify the resulting artifact. It is
+  not wired to a conversion action in the UI.
+- **OpenVINO inference view** — the UI can display/select OpenVINO artifacts
+  and submit inference requests through the existing Core service. Inference
+  remains disabled by the current capability policy for all admitted Core
+  versions; no hardware-backed inference is claimed.
+- **Conversation storage implementation** — a SQLite-backed store exists and
+  ChatView can use it when given a store. The normal MainWindow composition
+  does not inject one, so persistent history is not active in the standard
+  application flow; Core owns the active session history.
+
+### Verification status
+
+The default suite provides unit and UI coverage, largely using fakes and
+mocks. Opt-in runtime integration evidence covers launch, readiness, and
+shutdown against real Core 0.5.1 and 0.6.1 installations, but only the tested
+endpoints and flows. It does not validate the full Core API, managed
+installation, real chat inference with a GGUF model, or OpenVINO hardware.
 
 ## Architecture
 
@@ -95,14 +120,20 @@ High-level layering, top to bottom (all packages under `src/castlearq_desktop/`)
   transport.
 - `core/interpreter_settings.py`, `core/interpreter_validator.py` — settings
   persistence and the bounded validation diagnostic.
+- `core/managed_environment.py`, `core/core_acquisition_service.py`,
+  `core/managed_environment_installer.py`, and
+  `core/installation_coordinator.py` — experimental managed environment and
+  Core installation services; currently not connected to the main UI.
+- `core/openvino_conversion_service.py` — experimental conversion service,
+  separate from the OpenVINO inference service and view.
 - `core/contracts/` — pure, dependency-free contracts (readiness evaluation,
   deadline arithmetic, shutdown budgets, the nine-code error vocabulary,
   interpreter validation, settings key, port constants). Higher layers depend
   on these contracts rather than on each other's internals.
-- `core/http_client.py`, `core/process_manager.py`,
-  `storage/conversation_store.py` — boundary placeholders whose operations
-  raise `NotImplementedError` by design; no network, process, or database
-  activity occurs through them.
+- `core/http_client.py` and `core/process_manager.py` — boundary placeholders
+  whose operations raise `NotImplementedError` by design. The SQLite
+  `storage/conversation_store.py` is implemented, but is not injected by the
+  standard MainWindow composition.
 
 ## Interpreter configuration and launch
 
@@ -118,6 +149,26 @@ High-level layering, top to bottom (all packages under `src/castlearq_desktop/`)
 - A validated launch executes exactly
   `[<absolute-python>, "-m", "castlearq.main", "serve"]` — one process per
   accepted startup attempt, without a shell.
+
+## Chat, artifacts, and optional features
+
+- Chat is available only after successful readiness. The capability policy
+  currently enables chat for all three admitted Core versions; selecting a
+  device for OpenVINO-backed chat is enabled only for Core 0.6.1. The UI
+  resolves artifact backends conservatively and does not infer a backend from
+  a file extension alone.
+- The local library displays the inventory reported by Core. Downloading a
+  model is performed through the running Core service; the experimental
+  managed acquisition service is a separate facility and is not used by this
+  UI action.
+- The managed installer currently targets Core 0.6.0. It is available as a
+  package service with unit-test coverage, but is not connected to a normal
+  UI installation flow and has not been validated as a real installation in
+  this preview.
+- The OpenVINO inference view and client code exist, but the current
+  capability policy disables inference for every admitted Core version.
+  The separate conversion service is also available in the package, but no
+  conversion action is connected to the UI.
 
 ## Readiness and compatibility admission (DEC-A)
 
@@ -155,14 +206,13 @@ input; DEC-A dynamics engage through the coordinator's installed-version
 provider, so production `READY` is unreachable until a version is both
 matched and allowlisted.
 
-The allowlist explicitly admits two versions: `0.5.1` and `0.6.0`,
-ratified under DEC-A (see `docs/adr-0005-core-version-admission.md`).
-Admission is exact-version only (no ranges, no wildcards): any other
-version, including newer Core releases from PyPI or GitHub, is not
-automatically compatible and stays fail-closed until it is separately
-audited, verified against integration requirements, and explicitly added
-to the allowlist. Automated tests with doubles and an explicit test-only
-allowlist entry remain isolated verification of the policy logic.
+The current allowlist admits exactly `0.5.1`, `0.6.0`, and `0.6.1`.
+CastleArq Core `0.6.2` is **not admitted or validated by Desktop**. Admission
+is exact-version only (no ranges, no wildcards): any other version is not
+automatically compatible and stays fail-closed until separately audited and
+explicitly added to the allowlist. `docs/adr-0005-core-version-admission.md`
+records the earlier ratification of 0.5.1 and 0.6.0; the current code
+allowlist also includes 0.6.1.
 
 ## Lifecycle and shutdown
 
@@ -187,12 +237,13 @@ allowlist entry remain isolated verification of the policy logic.
 
 ## Setup
 
-Requirements: Linux; Python 3.11 or newer; PySide6 6.5 or newer; and
-CastleArq Core **either `0.5.1` or `0.6.0`, installed separately in the interpreter you
-select** (Desktop never installs or upgrades Core for you — see the Core
-project's own installation instructions). Other
-platforms are not validated and no native installers (AppImage, `.deb`) are
-provided in this preview.
+Requirements: Linux; Python 3.11 or newer; PySide6 6.5 or newer; and an
+admitted CastleArq Core version (**0.5.1, 0.6.0, or 0.6.1**) installed in the
+interpreter you select. Core **0.6.2 is not admitted or validated**. The
+standard UI startup flow does not install or upgrade Core. Experimental
+managed installation services are present in the package but are not
+connected to that UI flow. Other platforms are not validated and no native
+installers (AppImage, `.deb`) are provided.
 
 Install the package (this installs PySide6 and the `castlearq-desktop` entry
 point, `castlearq_desktop.app:main`):
@@ -217,10 +268,12 @@ has the `castlearq` package installed, then press *Start Core*.
 1. Start the application with `castlearq-desktop` (or
    `python -m castlearq_desktop`).
 2. Click **“Select Python interpreter…”** and choose the absolute path of the
-   Python interpreter that has an admitted CastleArq Core version (`0.5.1` or `0.6.0`) installed.
+   Python interpreter that has an admitted CastleArq Core version (`0.5.1`,
+   `0.6.0`, or `0.6.1`) installed.
    The choice is persisted via `QSettings`; nothing is launched until you request it.
 3. Click **“Start Core”**. If the interpreter path is invalid, Core is not
-   installed there, its version is not an admitted version (`0.5.1` or `0.6.0`), Core is unreachable,
+   installed there, its version is not an admitted version (`0.5.1`, `0.6.0`,
+   or `0.6.1`), Core is unreachable,
    or readiness fails, the status line reports the cause with an actionable
    message (missing distribution, version mismatch, transport failure, or
    timeout) instead of starting.
@@ -243,7 +296,8 @@ Two suites exist, with different purposes:
   Deterministic; processes, clocks, timers, and HTTP are faked or simulated.
   Tests that require Qt skip automatically when PySide6 is unavailable. The
   test extra (`pip install -e ".[test]"`) is for development only; running
-  the application itself needs just the base install plus Core `0.5.1` or `0.6.0`.
+  the application itself needs just the base install plus an admitted Core
+  version (`0.5.1`, `0.6.0`, or `0.6.1`).
 
 - **Runtime integration tests** (opt-in only):
 
@@ -276,9 +330,18 @@ Two suites exist, with different purposes:
   Every other version — including newer Core releases — stays fail-closed
   until separately audited against contract requirements and explicitly
   added to the allowlist.
-- No conversation persistence is implemented: chat history lives in the
-  running Core session and is deleted when the session closes; closing the
-  window deletes the session.
+- **Conversation persistence is not active in the standard UI composition.**
+  The SQLite store is implemented and ChatView accepts it, but MainWindow does
+  not currently inject it. Active chat history lives in the Core session and
+  is deleted when the session closes; closing the window deletes the session.
+- **Managed installation is experimental and not UI-integrated.** The
+  acquisition/installation services have unit tests, but no end-to-end
+  managed installation through the normal application flow is claimed.
+- **OpenVINO conversion is not UI-integrated.** The conversion service has
+  unit tests; those do not establish compatibility with real conversion
+  tools or hardware. Inference is disabled by the current capability policy.
+- Real GGUF chat inference and hardware-specific behavior have not been
+  validated as part of this preview.
 - No bundled Linux installers (AppImage, `.deb`) are provided; installation is
   via `pip` as described above.
 - Interpreter validation is synchronous on the calling thread (bounded to
@@ -306,20 +369,21 @@ Two suites exist, with different purposes:
 
 ## Project status
 
-Experimental Preview 0.1.0: configuration → validation → launch → observation
+Experimental Preview 0.1.1: configuration → validation → launch → observation
 → readiness → coordinated shutdown, plus the model catalog explorer, model
 acquisition through Core, the local artifact library, and real chat sessions
 against Core, are implemented and covered by a deterministic unit/contract
 suite plus the opt-in runtime integration suite. The project is suitable for
-a limited experimental preview on Linux with the limitations above.
-Conversation persistence, native installers, and universal model/hardware
-support remain out of scope for this preview.
+a limited experimental preview on Linux with the limitations above. Managed
+installation and OpenVINO conversion services are included as experimental,
+not UI-integrated functionality. Native installers and universal
+model/hardware support remain out of scope for this preview.
 
 ## Reporting issues
 
 Please report problems at
 [https://github.com/NicolasBruna24/CastleArq-Desktop/issues](https://github.com/NicolasBruna24/CastleArq-Desktop/issues)
-(`origin` remote verified locally). Include the Desktop version (`0.1.0`),
+(`origin` remote verified locally). Include the Desktop version (`0.1.1`),
 the exact Core version installed, the interpreter path selected, the
 status-line message shown, and — for chat or library problems — the model id,
 artifact filename, and observed quantization/state.

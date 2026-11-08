@@ -14,27 +14,38 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 
-"""Tests for the chat view.
+"""Tests for ChatView controls and its persistent Core session flow.
 
-The service is always a double: the view's own behaviour (control states,
-history, artifact changes) is what is under test, never Core.
+Most tests use a service double; the end-to-end session test uses the real
+client and service with a controlled transport and thread pool.
 """
 
 from __future__ import annotations
 
+import json
 from typing import Any, Optional
 
 import pytest
 
 from PySide6.QtCore import QObject, Signal
 
+from castlearq_desktop.core.chat_client import CHAT_SESSIONS_PATH, CoreChatClient
 from castlearq_desktop.core.download_service import LocalArtifact, StoreState
+from castlearq_desktop.core.chat_service import ChatService
 from castlearq_desktop.ui.chat_view import ChatView
 
 ARTIFACT = LocalArtifact(
     model_id="demo-model",
     filename="demo.gguf",
+    backend="gguf",
     quantization="Q4_K_M",
+    size_bytes=1024,
+    state=StoreState.VERIFIED,
+)
+OPENVINO_ARTIFACT = LocalArtifact(
+    model_id="openvino-model",
+    filename="openvino-model.xml",
+    backend="openvino",
     size_bytes=1024,
     state=StoreState.VERIFIED,
 )
@@ -45,6 +56,7 @@ class FakeService(QObject):
 
     session_opened = Signal(str, str)
     turn_completed = Signal(str, int)
+    open_session_refused = Signal(str)
     failed = Signal(str)
     busy_changed = Signal(bool)
 
@@ -53,7 +65,7 @@ class FakeService(QObject):
         self.is_busy = False
         self.refuse_open = False
         self.refuse_send = False
-        self.opened: list[tuple[str, str, Optional[str]]] = []
+        self.opened: list[tuple[str, str, Optional[str], Optional[str]]] = []
         self.turns: list[str] = []
         self.closed_sessions = 0
         self.invalidations = 0
@@ -63,7 +75,7 @@ class FakeService(QObject):
     ) -> bool:
         if self.refuse_open:
             return False
-        self.opened.append((model_id, filename or "", quantization or ""))
+        self.opened.append((model_id, filename or "", quantization, device))
         return True
 
     def send_turn(self, prompt: str) -> bool:
@@ -92,6 +104,8 @@ def qapp():
 def view(qapp):
     service = FakeService()
     widget = ChatView(service)  # type: ignore[arg-type]
+    widget.set_chat_supported(True)
+    widget.set_chat_device_supported(True)
     yield widget, service
     widget.deleteLater()
 
@@ -112,13 +126,151 @@ def test_selecting_an_artifact_enables_starting_the_chat(view) -> None:
     assert widget._send_button.isEnabled() is False
 
 
+def test_chat_uses_only_explicit_backends_from_real_inventory(view) -> None:
+    from pathlib import Path
+
+    from castlearq_desktop.core.download_service import parse_artifacts
+
+    widget, service = view
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "core_list_with_formats.json"
+    )
+    artifacts, error = parse_artifacts(fixture.read_text(encoding="utf-8"))
+
+    assert error is None
+    explicit_openvino = next(item for item in artifacts if item.backend == "openvino")
+    widget.set_artifact(explicit_openvino)
+    assert widget._start_button.isEnabled() is True
+    widget._on_start()
+    assert [opened[0] for opened in service.opened] == [explicit_openvino.model_id]
+    assert all(item.backend is None for item in artifacts if item.format == "GGUF")
+
+
+def test_incompatible_artifact_explains_why_chat_cannot_start(view) -> None:
+    widget, service = view
+    artifact = LocalArtifact(
+        model_id="other-model",
+        filename="other.bin",
+        backend="unsupported",
+    )
+
+    widget.set_artifact(artifact)
+
+    assert widget._start_button.isEnabled() is False
+    assert "no compatible" in widget._status.text().lower()
+    widget._on_start()
+    assert service.opened == []
+
+
+def test_unknown_backend_explains_why_chat_cannot_start(view) -> None:
+    widget, service = view
+    widget.set_artifact(
+        LocalArtifact(model_id="unknown-model", filename="unknown.bin")
+    )
+
+    assert widget._start_button.isEnabled() is False
+    assert "desconocido" in widget._status.text().lower()
+    widget._on_start()
+    assert service.opened == []
+
+
+def test_service_open_refusal_is_shown_without_marking_a_turn_failed(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "demo-model")
+    widget._prompt.setPlainText("turno pendiente")
+    widget._awaiting_turn = True
+    message = "Ya hay una sesión activa."
+
+    service.open_session_refused.emit(message)
+
+    assert widget._status.text() == message
+    assert widget._awaiting_turn is True
+    assert "Error:" not in widget._history.toPlainText()
+
+
+def test_closing_session_has_a_visible_transient_status(view) -> None:
+    widget, _ = view
+    widget.set_artifact(ARTIFACT)
+    widget._on_session_opened("session-1", "demo-model")
+
+    widget.close_session()
+
+    assert "Cerrando" in widget._status.text()
+    widget._on_busy_changed(False)
+    assert "Artefacto para el chat" in widget._status.text()
+
+
 def test_starting_the_chat_sends_the_logical_selectors_of_the_artifact(view) -> None:
     widget, service = view
     widget.set_artifact(ARTIFACT)
 
     widget._on_start()
 
-    assert service.opened == [("demo-model", "demo.gguf", "Q4_K_M")]
+    assert service.opened == [("demo-model", "demo.gguf", "Q4_K_M", None)]
+
+
+def test_openvino_shows_device_selector_and_starts_with_selected_device(view) -> None:
+    widget, service = view
+    widget.set_artifact(OPENVINO_ARTIFACT)
+    widget._device_combo.setCurrentText("GPU")
+
+    assert widget._device_label.isHidden() is False
+    assert widget._device_combo.isHidden() is False
+    assert widget._device_combo.isEnabled() is True
+
+    widget._on_start()
+
+    assert service.opened == [
+        ("openvino-model", "openvino-model.xml", None, "GPU")
+    ]
+
+
+def test_openvino_device_is_fixed_until_session_closes(view) -> None:
+    widget, _ = view
+    widget.set_artifact(OPENVINO_ARTIFACT)
+    widget._on_start()
+    widget._on_session_opened("session-1", "openvino-model")
+
+    assert widget._device_combo.isEnabled() is False
+
+    widget.close_session()
+
+    assert widget._device_combo.isEnabled() is True
+
+
+def test_chat_without_device_capability_hides_selector_and_omits_device(view) -> None:
+    widget, service = view
+    widget.set_chat_device_supported(False)
+    widget.set_artifact(OPENVINO_ARTIFACT)
+    assert widget._device_combo.isHidden() is True
+    widget._on_start()
+    assert service.opened[-1] == ("openvino-model", "openvino-model.xml", None, None)
+
+
+def test_chat_capability_invalidation_disables_open_session_turns(view) -> None:
+    widget, service = view
+    widget._session_id = "old-session"
+    service.has_session = True
+    widget.set_chat_supported(False)
+    assert widget._start_button.isEnabled() is False
+    assert widget._send_button.isEnabled() is False
+    assert widget._prompt.isEnabled() is False
+
+
+def test_gguf_keeps_device_selector_hidden_and_does_not_send_a_device(view) -> None:
+    widget, service = view
+    widget.set_artifact(ARTIFACT)
+
+    assert widget._device_label.isHidden() is True
+    assert widget._device_combo.isHidden() is True
+
+    widget._on_start()
+
+    assert service.opened == [("demo-model", "demo.gguf", "Q4_K_M", None)]
 
 
 def test_starting_without_an_artifact_does_nothing(view) -> None:
@@ -182,6 +334,24 @@ def test_a_completed_turn_is_shown_in_the_history(view) -> None:
     widget._on_session_opened("session-1", "demo-model")
     widget._on_turn_completed("hola", 1)
     assert "hola" in widget._history.toPlainText()
+
+
+def test_normal_response_is_shown_unchanged(view) -> None:
+    widget, _ = view
+
+    widget._on_turn_completed("Respuesta normal.", 1)
+
+    assert "Core (1): Respuesta normal." in widget._history.toPlainText()
+
+
+def test_think_blocks_are_removed_from_the_visible_response(view) -> None:
+    widget, _ = view
+
+    widget._on_turn_completed("<think>razonamiento</think>Respuesta final.", 1)
+
+    visible_history = widget._history.toPlainText()
+    assert "Respuesta final." in visible_history
+    assert "razonamiento" not in visible_history
 
 
 def test_the_user_prompt_is_shown_before_it_is_sent(view) -> None:
@@ -255,7 +425,7 @@ def test_changing_the_artifact_closes_the_open_session(view) -> None:
     widget._on_session_opened("session-1", "demo-model")
 
     other = LocalArtifact(
-        model_id="otro-model", filename="otro.gguf", state=StoreState.VERIFIED
+        model_id="otro-model", filename="otro.gguf", backend="gguf", state=StoreState.VERIFIED
     )
     widget.set_artifact(other)
 
@@ -684,3 +854,118 @@ def test_rename_identity_preserved(view) -> None:
     widget._session_id = 'session-1'
     assert widget._conversation_id == 'active-id'
     assert widget._session_id == 'session-1'
+
+
+class _ControlledPool:
+    def __init__(self) -> None:
+        self._runnables: list[Any] = []
+
+    def start(self, runnable: Any) -> None:
+        self._runnables.append(runnable)
+
+    def release(self) -> None:
+        self._runnables.pop(0).run()
+
+
+class _PersistentSessionTransport:
+    def __init__(self) -> None:
+        self.calls: list[tuple[str, str, Optional[dict[str, Any]]]] = []
+        self._turn_count = 0
+
+    def __call__(
+        self,
+        method: str,
+        path: str,
+        body: Optional[bytes] = None,
+        timeout: float = 30.0,
+    ) -> tuple[int, Optional[bytes]]:
+        payload = json.loads(body.decode("utf-8")) if body else None
+        self.calls.append((method, path, payload))
+        if method == "POST" and path == CHAT_SESSIONS_PATH:
+            response = {"session_id": "openvino-session", "model_id": "openvino-model"}
+            return 201, json.dumps(response).encode("utf-8")
+        if method == "POST" and path.endswith("/turns"):
+            self._turn_count += 1
+            response = {
+                "session_id": "openvino-session",
+                "response": f"respuesta-{self._turn_count}",
+                "turn_count": self._turn_count,
+            }
+            return 200, json.dumps(response).encode("utf-8")
+        if method == "DELETE":
+            return 204, None
+        raise AssertionError(f"Unexpected request: {method} {path}")
+
+
+@pytest.mark.parametrize(
+    ("artifact", "device", "session_payload"),
+    [
+        (
+            ARTIFACT,
+            "CPU",
+            {
+                "model_id": "demo-model",
+                "filename": "demo.gguf",
+                "quantization": "Q4_K_M",
+            },
+        ),
+        (
+            OPENVINO_ARTIFACT,
+            "GPU",
+            {
+                "model_id": "openvino-model",
+                "filename": "openvino-model.xml",
+                "device": "GPU",
+            },
+        ),
+    ],
+)
+def test_chat_uses_one_persistent_session_for_two_turns_and_close(
+    qapp, artifact, device, session_payload
+) -> None:
+    transport = _PersistentSessionTransport()
+    client = CoreChatClient("http://127.0.0.1:8000", transport=transport)
+    pool = _ControlledPool()
+    service = ChatService(client=client, thread_pool_factory=lambda: pool)
+    widget = ChatView(service)
+    widget.set_chat_supported(True)
+    widget.set_chat_device_supported(True)
+    widget.set_artifact(artifact)
+    widget._device_combo.setCurrentText(device)
+
+    widget._on_start()
+    pool.release()
+    assert widget._session_id == "openvino-session"
+
+    for prompt in ("primer turno", "segundo turno"):
+        widget._prompt.setPlainText(prompt)
+        widget._on_send()
+        pool.release()
+
+    visible_history = widget._history.toPlainText()
+    widget.close_session()
+    pool.release()
+
+    assert transport.calls == [
+        (
+            "POST",
+            CHAT_SESSIONS_PATH,
+            session_payload,
+        ),
+        (
+            "POST",
+            f"{CHAT_SESSIONS_PATH}/openvino-session/turns",
+            {"prompt": "primer turno"},
+        ),
+        (
+            "POST",
+            f"{CHAT_SESSIONS_PATH}/openvino-session/turns",
+            {"prompt": "segundo turno"},
+        ),
+        ("DELETE", f"{CHAT_SESSIONS_PATH}/openvino-session", None),
+    ]
+    assert "primer turno" in visible_history
+    assert "respuesta-1" in visible_history
+    assert "segundo turno" in visible_history
+    assert "respuesta-2" in visible_history
+    assert widget._session_id is None

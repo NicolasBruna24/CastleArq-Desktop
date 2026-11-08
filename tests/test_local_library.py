@@ -13,6 +13,8 @@ from __future__ import annotations
 import json
 from typing import Any, Optional
 
+import pytest
+
 from PySide6.QtCore import Qt
 
 from castlearq_desktop.core.download_service import (
@@ -57,11 +59,15 @@ def _artifact(
     status: str = "verified",
     size_bytes: Optional[int] = 16,
     problem: Optional[str] = None,
+    backend: Optional[str] = None,
+    format: Optional[str] = None,
 ) -> dict:
     """One artifact entry exactly as Core's ``list --json`` reports it."""
     return {
         "filename": filename,
         "model_id": model_id,
+        "backend": backend,
+        "format": format,
         "problem": problem,
         "quantization": (
             {"status": "known", "value": quantization}
@@ -462,6 +468,111 @@ def test_view_selects_an_artifact(qapp):
     assert "demo.gguf" in view._detail.text()
 
 
+def test_chat_action_is_enabled_for_gguf_and_openvino_and_emits_artifact(qapp):
+    view, _ = _view(
+        [
+            FakeProcess(
+                stdout=_envelope(
+                    [
+                        _artifact(backend="gguf"),
+                        _artifact(
+                            model_id="openvino-model",
+                            filename="model.xml",
+                            quantization=None,
+                            backend="openvino",
+                        ),
+                        _artifact(
+                            model_id="unknown-model",
+                            filename="unknown.bin",
+                            quantization=None,
+                        ),
+                    ]
+                )
+            )
+        ]
+    )
+    view._on_refresh()
+    chat_requested: list[LocalArtifact] = []
+    openvino_requested: list[LocalArtifact] = []
+    view.open_chat_requested.connect(chat_requested.append)
+    view.open_openvino_requested.connect(openvino_requested.append)
+
+    view._list.setCurrentRow(0)
+    assert view._open_chat_button.isEnabled() is True
+    assert view._open_openvino_button.isEnabled() is False
+    selected_gguf = view.selected_artifact
+    view._open_chat_button.click()
+    assert chat_requested == [selected_gguf]
+
+    view._list.setCurrentRow(1)
+    assert view._open_chat_button.isEnabled() is True
+    assert view._open_openvino_button.isEnabled() is True
+    selected_openvino = view.selected_artifact
+    view._open_openvino_button.click()
+    assert openvino_requested == [selected_openvino]
+
+    view._list.setCurrentRow(2)
+    assert view._open_chat_button.isEnabled() is False
+    assert view._open_openvino_button.isEnabled() is False
+
+
+@pytest.mark.parametrize("artifact_format", ["GGUF", "OpenVINO IR"])
+def test_missing_backend_keeps_artifact_visible_but_actions_disabled(qapp, artifact_format):
+    view, _ = _view([
+        FakeProcess(stdout=_envelope([
+            _artifact(filename="artifact", backend=None, format=artifact_format)
+        ]))
+    ])
+    view._on_refresh()
+    assert view._list.count() == 1
+    view._list.setCurrentRow(0)
+    assert view.selected_artifact is not None
+    assert view.selected_artifact.backend is None
+    assert view._open_chat_button.isEnabled() is False
+    assert view._open_openvino_button.isEnabled() is False
+
+
+def test_real_formatted_inventory_enables_actions_for_parsed_backends(qapp):
+    from pathlib import Path
+
+    fixture = (
+        Path(__file__).parent
+        / "fixtures"
+        / "core_list_with_formats.json"
+    )
+    view, _ = _view([FakeProcess(stdout=fixture.read_text(encoding="utf-8"))])
+    view._on_refresh()
+
+    assert len(view.artifacts) == 10
+    chat_requested: list[LocalArtifact] = []
+    openvino_requested: list[LocalArtifact] = []
+    view.open_chat_requested.connect(chat_requested.append)
+    view.open_openvino_requested.connect(openvino_requested.append)
+
+    rows_by_backend: dict[str, list[int]] = {"gguf": [], "openvino": []}
+    for row in range(view._list.count()):
+        artifact = view._list.item(row).data(Qt.UserRole)
+        if artifact.backend in rows_by_backend:
+            rows_by_backend[artifact.backend].append(row)
+
+    assert len(rows_by_backend["gguf"]) == 0
+    assert len(rows_by_backend["openvino"]) == 4
+
+    for row in range(view._list.count()):
+        artifact = view._list.item(row).data(Qt.UserRole)
+        if artifact.backend is None:
+            view._list.setCurrentRow(row)
+            assert view._open_chat_button.isEnabled() is False
+            assert view._open_openvino_button.isEnabled() is False
+
+    for row in rows_by_backend["openvino"]:
+        view._list.setCurrentRow(row)
+        assert view._open_chat_button.isEnabled() is True
+        assert view._open_openvino_button.isEnabled() is True
+    view._open_openvino_button.click()
+    assert openvino_requested[0].backend == "openvino"
+
+
 def test_view_reports_unverified_artifact(qapp):
     view, _ = _view(
         [FakeProcess(stdout=_envelope([_artifact(status="downloaded")]))]
@@ -694,11 +805,13 @@ def _installed(
     filename: str,
     quantization: Optional[str] = "Q4_K_M",
     state: StoreState = StoreState.VERIFIED,
+    backend: Optional[str] = None,
 ) -> LocalArtifact:
     """One installed artifact as Core would report it."""
     return LocalArtifact(
         model_id=model_id,
         filename=filename,
+        backend=backend,
         quantization=quantization,
         state=state,
     )
@@ -1248,11 +1361,17 @@ def test_selecting_same_model_id_as_the_chat_artifact_keeps_session(qapp):
 
 def test_catalog_browsing_without_session_keeps_chat_startable(qapp):
     """Sin sesión, explorar el catálogo no rompe ni bloquea el chat."""
+    from types import SimpleNamespace
+
     from castlearq_desktop.ui.main_window import MainWindow
 
     window = MainWindow()
+    window._controller = SimpleNamespace(
+        installed_core_version="0.6.1", shutdown_complete=True
+    )
+    window._on_readiness_result(SimpleNamespace(ready=True, error_code=None))
     lib = window._local_library
-    a = _installed("modelo-a", "a.gguf")
+    a = _installed("modelo-a", "a.gguf", backend="gguf")
     lib._on_finished([a])
     lib._list.setCurrentRow(0)
     chat = window._chat_view

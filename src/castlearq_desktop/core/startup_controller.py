@@ -119,6 +119,11 @@ class StartupController(QObject):
         """Whether a terminal shutdown outcome has already been emitted."""
         return self._shutdown_terminal
 
+    @property
+    def installed_core_version(self) -> Optional[str]:
+        """Version confirmed by the active startup coordinator, if known."""
+        return getattr(self._coordinator, "installed_core_version", None)
+
     # -- startup ------------------------------------------------------------
     def start(self) -> Any:
         """Request a single Core startup attempt.

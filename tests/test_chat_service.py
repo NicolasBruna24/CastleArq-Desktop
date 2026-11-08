@@ -122,6 +122,29 @@ def test_opening_a_session_reports_the_session(qapp) -> None:
     assert service.is_busy is False
 
 
+def test_opening_a_session_forwards_the_requested_device(qapp) -> None:
+    client = FakeClient()
+    service = _service(client, ImmediatePool())
+
+    assert service.open_session(
+        "openvino-model",
+        filename="model.xml",
+        device="GPU",
+    ) is True
+
+    assert client.calls[0] == (
+        "create_session",
+        (
+            "openvino-model",
+            (
+                ("device", "GPU"),
+                ("filename", "model.xml"),
+                ("quantization", None),
+            ),
+        ),
+    )
+
+
 def test_opening_a_session_without_a_model_is_refused(qapp) -> None:
     client = FakeClient()
     service = _service(client, ImmediatePool())
@@ -140,6 +163,8 @@ def test_opening_while_a_session_is_active_is_refused(qapp) -> None:
     service = _service(client, ImmediatePool())
     failures: list[str] = []
     service.failed.connect(failures.append)
+    refused: list[str] = []
+    service.open_session_refused.connect(refused.append)
     busy: list[bool] = []
     service.busy_changed.connect(busy.append)
 
@@ -149,7 +174,7 @@ def test_opening_while_a_session_is_active_is_refused(qapp) -> None:
     generation = service._generation
     active_generation = service._active_generation
 
-    # 1. The duplicate is refused with the regular rejection contract.
+    # 1. The duplicate is refused with a user-visible local reason.
     assert service.open_session("demo-model") is False
 
     # 2. No second creation reached Core and the session is the same one.
@@ -157,13 +182,63 @@ def test_opening_while_a_session_is_active_is_refused(qapp) -> None:
     assert service.session_id == SESSION_ID
     assert service.has_session is True
     # The refusal issues no DELETE, publishes no state change, leaves the
-    # generations untouched and reports no fake failure.
+    # generations untouched and reports no Core failure.
     assert all(call[0] != "delete_session" for call in client.calls)
     assert busy == busy_after_first
     assert service._generation == generation
     assert service._active_generation == active_generation
     assert service.is_busy is False
     assert failures == []
+    assert refused == [
+        "Ya hay una sesión activa. Puedes continuarla o cerrarla antes de iniciar otra."
+    ]
+
+
+def test_opening_while_an_operation_is_busy_reports_the_reason(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    refused: list[str] = []
+    service.open_session_refused.connect(refused.append)
+
+    assert service.open_session("demo-model") is True
+    assert service.open_session("otro-model") is False
+
+    assert refused == [
+        "Ya se está abriendo una sesión de chat; espera a que termine."
+    ]
+    assert len([call for call in client.calls if call[0] == "create_session"]) == 0
+
+
+def test_opening_while_a_session_is_closing_reports_the_reason(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    refused: list[str] = []
+    service.open_session_refused.connect(refused.append)
+
+    service.open_session("demo-model")
+    pool.release()
+    assert service.close_session() is True
+    assert service.is_busy is True
+
+    assert service.open_session("otro-model") is False
+    assert refused == [
+        "La sesión de chat se está cerrando; espera a que termine."
+    ]
+    pool.release()
+
+
+def test_opening_after_service_shutdown_reports_the_reason(qapp) -> None:
+    service = _service(FakeClient(), ImmediatePool())
+    service.close()
+    refused: list[str] = []
+    service.open_session_refused.connect(refused.append)
+
+    assert service.open_session("demo-model") is False
+    assert refused == [
+        "Chat se está cerrando y no puede abrir otra sesión."
+    ]
 
 
 def test_a_session_refused_as_duplicate_is_still_closable(qapp) -> None:
@@ -269,6 +344,170 @@ def test_a_result_of_an_invalidated_operation_is_dropped(qapp) -> None:
 
     assert opened == []
     assert service.has_session is False
+
+
+def test_invalidated_pending_open_is_compensated(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    opened: list[tuple[str, str]] = []
+    service.session_opened.connect(lambda sid, mid: opened.append((sid, mid)))
+
+    assert service.open_session("demo-model") is True
+    service.invalidate()
+    pool.release(0)
+
+    assert opened == []
+    assert service.has_session is False
+    assert ("delete_session", (SESSION_ID,)) in client.calls
+
+
+def test_old_open_cleanup_cannot_replace_or_close_a_new_session(qapp) -> None:
+    class SequencedClient(FakeClient):
+        def __init__(self) -> None:
+            super().__init__()
+            self.infos = {
+                "old-model": ChatSessionInfo("session-old", "old-model", "ready"),
+                "new-model": ChatSessionInfo("session-new", "new-model", "ready"),
+            }
+
+        def create_session(self, model_id: str, **kwargs: Any) -> ChatSessionInfo:
+            self.calls.append(("create_session", (model_id, tuple(sorted(kwargs.items())))))
+            return self.infos[model_id]
+
+    client = SequencedClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    opened: list[tuple[str, str]] = []
+    service.session_opened.connect(lambda sid, mid: opened.append((sid, mid)))
+
+    service.open_session("old-model")
+    service.invalidate()
+    service.open_session("new-model")
+    pool.release(1)
+    assert service.session_id == "session-new"
+    pool.release(0)
+
+    assert opened == [("session-new", "new-model")]
+    assert service.session_id == "session-new"
+    assert ("delete_session", ("session-old",)) in client.calls
+    assert ("delete_session", ("session-new",)) not in client.calls
+
+
+def test_close_during_pending_open_cleans_late_session_and_is_idempotent(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    opened: list[tuple[str, str]] = []
+    closed: list[bool] = []
+    service.session_opened.connect(lambda sid, mid: opened.append((sid, mid)))
+    service.closed.connect(lambda: closed.append(True))
+
+    service.open_session("demo-model")
+    service.close()
+    service.close()
+    pool.release(0)
+
+    assert opened == []
+    assert service.has_session is False
+    assert ("delete_session", (SESSION_ID,)) in client.calls
+    assert closed == [True]
+
+
+def test_close_session_without_id_invalidates_pending_open(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    opened: list[tuple[str, str]] = []
+    service.session_opened.connect(lambda sid, mid: opened.append((sid, mid)))
+
+    service.open_session("demo-model")
+    assert service.close_session() is False
+    pool.release(0)
+
+    assert opened == []
+    assert service.has_session is False
+    assert ("delete_session", (SESSION_ID,)) in client.calls
+
+
+def test_repeated_invalidation_of_pending_open_schedules_one_cleanup(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+
+    service.open_session("demo-model")
+    service.invalidate()
+    service.invalidate()
+    service.invalidate()
+    pool.release(0)
+
+    assert [call for call in client.calls if call[0] == "delete_session"] == [
+        ("delete_session", (SESSION_ID,))
+    ]
+    assert service.has_session is False
+
+
+def test_invalidation_closes_open_session_and_drops_late_turn(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    turns: list[tuple[str, int]] = []
+    service.turn_completed.connect(lambda response, count: turns.append((response, count)))
+
+    service.open_session("demo-model")
+    pool.release(0)
+    service.send_turn("pregunta anterior")
+    service.invalidate()
+    pool.release(1)
+    pool.release(2)
+
+    assert service.has_session is False
+    assert turns == []
+    assert ("delete_session", (SESSION_ID,)) in client.calls
+
+
+def test_duplicate_open_delivery_does_not_restore_invalidated_session(qapp) -> None:
+    client = FakeClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    opened: list[tuple[str, str]] = []
+    service.session_opened.connect(lambda sid, mid: opened.append((sid, mid)))
+
+    service.open_session("demo-model")
+    generation = service._active_generation
+    pool.release(0)
+    service.invalidate()
+    service._on_resolved(
+        (generation, "opened", ChatSessionInfo(SESSION_ID, "demo-model", "ready"), None)
+    )
+    pool.release(1)
+
+    assert opened == [(SESSION_ID, "demo-model")]
+    assert service.has_session is False
+    assert [call for call in client.calls if call[0] == "delete_session"] == [
+        ("delete_session", (SESSION_ID,))
+    ]
+
+
+def test_compensatory_cleanup_failure_does_not_restore_session(qapp, caplog) -> None:
+    class DeleteFailureClient(FakeClient):
+        def delete_session(self, session_id: str) -> None:
+            self.calls.append(("delete_session", (session_id,)))
+            raise ChatClientError("fallo al borrar", reason="server_error")
+
+    client = DeleteFailureClient()
+    pool = DeferredPool()
+    service = _service(client, pool)
+    failures: list[str] = []
+    service.failed.connect(failures.append)
+
+    service.open_session("demo-model")
+    service.invalidate()
+    pool.release(0)
+
+    assert service.has_session is False
+    assert failures == []
+    assert "Could not clean up an invalidated Chat session" in caplog.text
 
 
 def test_a_late_failure_of_a_superseded_operation_is_dropped(qapp) -> None:
@@ -452,3 +691,26 @@ def test_a_core_failure_is_reported_to_the_view(qapp) -> None:
     assert failures == ["el Core está ocupado"]
     assert service.has_session is False
     assert service.is_busy is False
+
+
+def test_a_core_http_open_failure_is_not_reported_as_a_local_refusal(qapp) -> None:
+    client = FakeClient(
+        error=ChatClientError(
+            "Core rechazó la petición del chat (sesión ocupada).",
+            status=409,
+            reason="busy",
+        )
+    )
+    service = _service(client, ImmediatePool())
+    failures: list[str] = []
+    refused: list[str] = []
+    service.failed.connect(failures.append)
+    service.open_session_refused.connect(refused.append)
+
+    assert service.open_session("demo-model") is True
+
+    assert failures == [
+        "Core rechazó la petición del chat (sesión ocupada)."
+    ]
+    assert refused == []
+    assert service.has_session is False

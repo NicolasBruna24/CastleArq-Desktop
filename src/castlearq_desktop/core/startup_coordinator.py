@@ -63,6 +63,11 @@ from castlearq_desktop.core.version_admission import (
     SUPPORTED_CORE_VERSIONS,
 )
 from castlearq_desktop.core.version_admission import query_installed_core_version
+from castlearq_desktop.core.managed_environment import (
+    _UNSET,
+    discover_managed_environment,
+    resolve_installed_core_version,
+)
 
 
 def manager_liveness(manager: LifecycleManager) -> Optional[bool]:
@@ -100,6 +105,7 @@ class CoreStartupCoordinator:
     #: exercise. Production injects a pool (see ``app.py``) so readiness never
     #: blocks the GUI thread on the 5 s subprocess.
     probe_pool: Optional[Any] = None
+    managed_environment_provider: Optional[Callable[[], Any]] = None
     observer: Optional[LifecycleObserver] = field(default=None, init=False)
     spawn_calls: int = field(default=0, init=False)
     _last_readiness_result: Optional[Any] = field(default=None, init=False)
@@ -123,6 +129,16 @@ class CoreStartupCoordinator:
     _probe_bridge: Optional[Any] = field(default=None, init=False)
     # Readiness transport of the active attempt, used to resume a held pass.
     _active_transport: Optional[Any] = field(default=None, init=False)
+    # Result of the sole managed-environment discovery for the active launch.
+    # _UNSET means no launch discovery has happened; None means it did and
+    # yielded no result.
+    _launch_managed_result: Any = field(default=_UNSET, init=False)
+    _launch_python: Optional[str] = field(default=None, init=False)
+
+    @property
+    def installed_core_version(self) -> Optional[str]:
+        """Version confirmed by this attempt's installed-version probe."""
+        return self._cached_installed_version if self._version_cache_valid else None
 
     def _ensure_manager(self) -> LifecycleManager:
         if self.manager is None:
@@ -146,34 +162,58 @@ class CoreStartupCoordinator:
         """Validate config and perform the single launch (no recovery)."""
         from castlearq_desktop.core.contracts import CastleArqError
         from castlearq_desktop.core.lifecycle_manager import OperationResult
-        python = self.settings.load()
-        if not python:
-            error = CastleArqError(ErrorCode.INTERPRETER_INVALID,
-                                   "No interpreter configured.",
-                                   {"configured": False})
+        # Every call starts a new generation, even if configuration, discovery,
+        # or validation fails. Results from older attempts cannot leak forward.
+        self._launch_managed_result = _UNSET
+        self._launch_python = None
+        self._version_cache_valid = False
+        self._cached_installed_version = None
+        self._version_generation += 1
+        self._version_probe_launched = False
+
+        discover = (self.managed_environment_provider
+                    if self.managed_environment_provider is not None
+                    else discover_managed_environment)
+        managed_result = discover()
+        self._launch_managed_result = managed_result
+
+        from castlearq_desktop.core.managed_environment import ManagedEnvironmentStatus
+        status = getattr(managed_result, "status", None)
+        if status is ManagedEnvironmentStatus.VALID:
+            managed_python = getattr(managed_result, "python_path", None)
+            python = str(managed_python) if managed_python is not None else None
+            configured = False
+        elif status in (ManagedEnvironmentStatus.MISSING,
+                        ManagedEnvironmentStatus.CORE_NOT_INSTALLED):
+            python = self.settings.load()
+            configured = True
+        else:
+            python = None
+            configured = status is None
+
+        if not python or not python.strip():
+            message = ("No interpreter configured." if configured
+                       else "Managed environment is not usable.")
+            error = CastleArqError(ErrorCode.INTERPRETER_INVALID, message,
+                                   {"configured": configured,
+                                    "managed_status": getattr(status, "value", None)})
             return OperationResult(status="failed",
                                    state=LifecycleState.NOT_STARTED,
                                    error=error, detail=str(error),
                                    context=dict(error.technical_context))
+
         outcome = (self.validator(python) if self.validator is not None
                    else validate_python_interpreter(python))
         if not outcome.is_valid:
             code = outcome.code or ErrorCode.INTERPRETER_INVALID
             error = CastleArqError(code, outcome.detail or "Invalid interpreter.",
-                                   {"configured": True})
+                                   {"configured": configured})
             return OperationResult(status="failed",
                                    state=LifecycleState.NOT_STARTED,
                                    error=error, detail=str(error),
                                    context=dict(error.technical_context))
-        # M1: a new attempt starts here (validation passed, a launch outcome
-        # — accepted, refused, or failed — is about to be produced). Reset
-        # the version cache so the previous attempt's value never leaks, and
-        # advance the generation so a probe still in flight for the previous
-        # attempt is recognised as stale when it is delivered.
-        self._version_cache_valid = False
-        self._cached_installed_version = None
-        self._version_generation += 1
-        self._version_probe_launched = False
+
+        self._launch_python = python
         manager = self._ensure_manager()
         result = manager.start(python)
 
@@ -213,19 +253,29 @@ class CoreStartupCoordinator:
             self._cached_installed_version = (
                 value if isinstance(value, str) else None)
             return self._cached_installed_version
+        # Explicit providers and the asynchronous probe keep their established
+        # precedence. The managed result is used by the synchronous default.
         if self.probe_pool is not None:
             # Asynchronous production path: launch at most one probe for this
             # attempt and report the version as pending until it is delivered.
             self._ensure_version_probe()
             return self._cached_installed_version
-        # No worker pool injected: preserve the original synchronous query.
+        # No worker pool injected: resolve from this launch's discovery result.
         self._version_cache_valid = True
         return self._resolve_installed_version_synchronously()
 
     def _resolve_installed_version_synchronously(self) -> Optional[str]:
         """Resolve the installed version with the bounded synchronous query."""
+        if self._launch_managed_result is not _UNSET:
+            self._cached_installed_version = resolve_installed_core_version(
+                settings=self.settings,
+                version_query=lambda python: query_installed_core_version(
+                    python, execute=self.version_executor),
+                managed_result=self._launch_managed_result,
+            )
+            return self._cached_installed_version
         try:
-            python = self.settings.load()
+            python = self._launch_python or self.settings.load()
         except Exception:
             self._cached_installed_version = None
             return None
@@ -250,7 +300,7 @@ class CoreStartupCoordinator:
         if self.probe_pool is None:
             return
         try:
-            python = self.settings.load()
+            python = self._launch_python or self.settings.load()
         except Exception:
             python = None
         if not python:

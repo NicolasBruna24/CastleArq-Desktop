@@ -425,3 +425,24 @@ def test_not_evaluated_without_provider_blocks_readiness():
     assert out.error_code is ErrorCode.API_CONTRACT_INCOMPATIBLE
     conds = [f.condition.value for f in out.outcome.failures]
     assert "api_contract" in conds
+
+
+def test_feature_capabilities_are_separate_from_startup_allowlist():
+    from castlearq_desktop.core.version_admission import (
+        SUPPORTED_CORE_VERSIONS,
+        capabilities_for_version,
+    )
+
+    assert SUPPORTED_CORE_VERSIONS == frozenset({"0.5.1", "0.6.0", "0.6.1"})
+    assert capabilities_for_version("0.5.1").chat is True
+    assert capabilities_for_version("0.5.1").chat_device is False
+    assert capabilities_for_version("0.6.0").chat is True
+    assert capabilities_for_version("0.6.0").chat_device is False
+    assert capabilities_for_version("0.6.1").chat is True
+    assert capabilities_for_version("0.6.1").chat_device is True
+    assert all(
+        not capabilities_for_version(version).openvino_inference
+        for version in SUPPORTED_CORE_VERSIONS
+    )
+    assert capabilities_for_version("0.6.2").chat is False
+    assert capabilities_for_version(None).chat_device is False

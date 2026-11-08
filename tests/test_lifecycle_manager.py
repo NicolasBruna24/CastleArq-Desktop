@@ -43,6 +43,7 @@ class FakeHandle:
         self.terminates = 0
         self.kills = 0
 
+    @property
     def is_alive(self):
         return self._alive
 
@@ -420,17 +421,22 @@ class FailingStatusHandle(FakeHandle):
         self.poll_calls = 0
         self.alive_calls = 0
 
-    def poll(self):
-        self.poll_calls += 1
-        raise RuntimeError("poll unavailable")
-
+    @property
     def is_alive(self):
         self.alive_calls += 1
         raise RuntimeError("status unavailable")
 
+    def poll(self):
+        self.poll_calls += 1
+        raise RuntimeError("poll unavailable")
+
 
 class PollFailAliveHandle(FakeHandle):
-    """poll() raises but is_alive() reports running."""
+    """poll() raises but is_alive reports running."""
+
+    @property
+    def is_alive(self):
+        return self._alive
 
     def poll(self):
         raise RuntimeError("poll unavailable")
@@ -526,6 +532,10 @@ class ScriptedStatusHandle(FakeHandle):
         self._script = list(script)
         self.probe_calls = 0
 
+    @property
+    def is_alive(self):
+        return self._next("alive")
+
     def _next(self, kind):
         self.probe_calls += 1
         assert self._script, f"unexpected extra probe ({kind})"
@@ -539,9 +549,6 @@ class ScriptedStatusHandle(FakeHandle):
     def poll(self):
         return self._next("poll")
 
-    def is_alive(self):
-        return self._next("alive")
-
 
 class CountingUnknownHandle(FakeHandle):
     """Always unknown; counts poll/is_alive invocations."""
@@ -551,13 +558,14 @@ class CountingUnknownHandle(FakeHandle):
         self.poll_calls = 0
         self.alive_calls = 0
 
-    def poll(self):
-        self.poll_calls += 1
-        raise RuntimeError("poll unavailable")
-
+    @property
     def is_alive(self):
         self.alive_calls += 1
         raise RuntimeError("status unavailable")
+
+    def poll(self):
+        self.poll_calls += 1
+        raise RuntimeError("poll unavailable")
 
 
 def _start_with_handle(mgr, adapter, handle):

@@ -8,13 +8,13 @@ version = "0.1.1"
 description = "Linux-first PySide6 desktop application for managing the CastleArq Core process lifecycle (experimental developer preview)."
 readme = "README.md"
 requires-python = ">=3.11"
-license = { text = "Apache-2.0" }
+license = "Apache-2.0"
 dependencies = [
     "PySide6>=6.5",
     # DEC-UD-1 (Core Update Discovery v1): PEP 440 version comparison. The
     # lower bound is the newest packaging release verified at implementation
     # time in the project environment; its Requires-Python (>=3.9) covers
-    # Desktop's floor (Python 3.10+) and the required API (Version ordering,
+    # Desktop's floor (Python 3.11+) and the required API (Version ordering,
     # is_prerelease, InvalidVersion) was contract-checked in isolation.
     # Declared explicitly: the service must not rely on a transitive install.
     "packaging>=26.3",
@@ -30,6 +30,10 @@ castlearq-desktop = "castlearq_desktop.app:main"
 
 [tool.setuptools.packages.find]
 where = ["src"]
+
+[tool.setuptools]
+include-package-data = false
+exclude-package-data = { "*" = ["*.bak*", "*.new", "*.o"] }
 
 [tool.pytest.ini_options]
 pythonpath = ["src"]

@@ -30,6 +30,7 @@ from castlearq_desktop.core.download_service import (
     LocalLibraryService,
     StoreInfo,
     StoreState,
+    is_chat_compatible_backend,
 )
 from castlearq_desktop.ui.styles import make_font
 
@@ -118,6 +119,7 @@ class LocalLibraryView(QWidget):
     artifact_selected = Signal(object)  # LocalArtifact
     artifact_unselected = Signal()
     open_chat_requested = Signal(object)  # LocalArtifact
+    open_openvino_requested = Signal(object)  # LocalArtifact
 
     def __init__(
         self,
@@ -179,6 +181,11 @@ class LocalLibraryView(QWidget):
         self._open_chat_button.setEnabled(False)
         self._open_chat_button.clicked.connect(self._on_open_chat)
         layout.addWidget(self._open_chat_button)
+
+        self._open_openvino_button = QPushButton("Abrir en OpenVINO", box)
+        self._open_openvino_button.setEnabled(False)
+        self._open_openvino_button.clicked.connect(self._on_open_openvino)
+        layout.addWidget(self._open_openvino_button)
 
         outer = QVBoxLayout(self)
         outer.setContentsMargins(12, 12, 12, 12)
@@ -298,6 +305,11 @@ class LocalLibraryView(QWidget):
             return
         self.open_chat_requested.emit(self._selected)
 
+    def _on_open_openvino(self) -> None:
+        if self._selected is None:
+            return
+        self.open_openvino_requested.emit(self._selected)
+
 
     def _on_current_changed(
         self, current: Optional[QListWidgetItem], _previous: Any
@@ -312,11 +324,15 @@ class LocalLibraryView(QWidget):
             self._selected = None
             self._detail.setText("")
             self._open_chat_button.setEnabled(False)
+            self._open_openvino_button.setEnabled(False)
             self.artifact_unselected.emit()
             return
         self._selected = artifact
         self._detail.setText("\n".join(self._detail_lines(artifact)))
-        self._open_chat_button.setEnabled(True)
+        self._open_chat_button.setEnabled(
+            is_chat_compatible_backend(getattr(artifact, "backend", None))
+        )
+        self._open_openvino_button.setEnabled(getattr(artifact, "backend", None) == "openvino")
         self.artifact_selected.emit(artifact)
 
     def _detail_lines(self, artifact: LocalArtifact) -> list[str]:

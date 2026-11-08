@@ -35,6 +35,8 @@ Desktop window.
 
 from __future__ import annotations
 
+import logging
+import threading
 from typing import Any, Optional
 
 from PySide6.QtCore import QObject, QRunnable, QThreadPool, Signal
@@ -47,6 +49,57 @@ from castlearq_desktop.core.chat_client import (
 )
 
 __all__ = ["ChatService"]
+
+_logger = logging.getLogger(__name__)
+
+
+class _OpenSessionGuard:
+    """Coordinate invalidation with a worker that may still open a session."""
+
+    def __init__(self) -> None:
+        self._lock = threading.Lock()
+        self._invalidated = False
+        self._info: Optional[ChatSessionInfo] = None
+        self._cleanup_claimed = False
+
+    def complete(self, info: ChatSessionInfo) -> tuple[bool, bool]:
+        """Return (may_publish, must_clean_up_here) for an open result."""
+        with self._lock:
+            self._info = info
+            if not self._invalidated:
+                return True, False
+            if self._cleanup_claimed:
+                return False, False
+            self._cleanup_claimed = True
+            return False, True
+
+    def invalidate(self) -> Optional[ChatSessionInfo]:
+        """Retire this open and claim cleanup if its result already arrived."""
+        with self._lock:
+            self._invalidated = True
+            if self._info is None or self._cleanup_claimed:
+                return None
+            self._cleanup_claimed = True
+            return self._info
+
+
+def _delete_session_safely(client: CoreChatClient, session_id: str) -> None:
+    try:
+        client.delete_session(session_id)
+    except Exception:  # noqa: BLE001 - cleanup must not revive stale state
+        _logger.warning("Could not clean up an invalidated Chat session", exc_info=True)
+
+
+class _SessionCleanupRunnable(QRunnable):
+    """Delete a session without involving the current Chat UI generation."""
+
+    def __init__(self, client: CoreChatClient, session_id: str) -> None:
+        super().__init__()
+        self._client = client
+        self._session_id = session_id
+
+    def run(self) -> None:
+        _delete_session_safely(self._client, self._session_id)
 
 
 class _ChatBridge(QObject):
@@ -88,6 +141,7 @@ class _ChatRunnable(QRunnable):
 
         session_id: Optional[str] = None,
         prompt: Optional[str] = None,
+        open_guard: Optional[_OpenSessionGuard] = None,
     ) -> None:
         super().__init__()
         self._bridge = bridge
@@ -101,6 +155,7 @@ class _ChatRunnable(QRunnable):
 
         self._session_id = session_id
         self._prompt = prompt
+        self._open_guard = open_guard
         self.setAutoDelete(True)
 
     def run(self) -> None:
@@ -113,6 +168,12 @@ class _ChatRunnable(QRunnable):
                     device=self._device,
 
                 )
+                if self._open_guard is not None:
+                    may_publish, clean_up_here = self._open_guard.complete(info)
+                    if not may_publish:
+                        if clean_up_here:
+                            _delete_session_safely(self._client, info.session_id)
+                        return
                 payload = (self._generation, "opened", info, None)
             elif self._operation == "turn":
                 result = self._client.send_turn(self._session_id or "", self._prompt or "")
@@ -140,6 +201,7 @@ class ChatService(QObject):
 
     session_opened = Signal(str, str)  # session_id, model_id
     turn_completed = Signal(str, int)  # response, turn_count
+    open_session_refused = Signal(str)  # reason opening was refused locally
     failed = Signal(str)  # user message
     busy_changed = Signal(bool)
     closed = Signal()
@@ -164,6 +226,8 @@ class ChatService(QObject):
         self._model_id: Optional[str] = None
         self._bridge: Optional[_ChatBridge] = None
         self._shutting_down = False
+        self._active_operation: Optional[str] = None
+        self._pending_open_guard: Optional[_OpenSessionGuard] = None
 
     # -- public state ------------------------------------------------------
 
@@ -199,30 +263,43 @@ class ChatService(QObject):
 
     ) -> bool:
         """Open a chat session on Core. Returns False when refused."""
-        if self._shutting_down or self.is_busy:
+        if self._shutting_down:
+            self.open_session_refused.emit(
+                "Chat se está cerrando y no puede abrir otra sesión."
+            )
+            return False
+        if self.is_busy:
+            messages = {
+                "open": "Ya se está abriendo una sesión de chat; espera a que termine.",
+                "turn": "Hay un turno de chat en curso; espera a que termine.",
+                "close": "La sesión de chat se está cerrando; espera a que termine.",
+            }
+            self.open_session_refused.emit(
+                messages.get(
+                    self._active_operation,
+                    "Chat está ocupado; espera a que termine la operación actual.",
+                )
+            )
             return False
         if self.has_session:
-            # A session is already open: creating a second one on Core
-            # would orphan the first session (its runtime would never be
-            # released) and silently replace the conversation. The
-            # duplicate is refused before reserving any generation or
-            # starting a worker, so the existing session — its id, its
-            # busy state and its history in Core — stays exactly as it
-            # is, and no failure is reported for a normal duplicate. All
-            # state mutations run on the GUI thread, so this check and
-            # the reservation below cannot interleave.
+            self.open_session_refused.emit(
+                "Ya hay una sesión activa. Puedes continuarla o cerrarla antes de iniciar otra."
+            )
             return False
         if not isinstance(model_id, str) or not model_id.strip():
             self.failed.emit("No hay un modelo seleccionado para iniciar el chat.")
             return False
         self._generation += 1
         self._active_generation = self._generation
+        open_guard = _OpenSessionGuard()
+        self._pending_open_guard = open_guard
         self._start(
             "open",
             model_id=model_id,
             filename=filename,
             quantization=quantization,
             device=device,
+            open_guard=open_guard,
 
         )
         return True
@@ -246,6 +323,9 @@ class ChatService(QObject):
         """Close the session on Core, discarding any in-flight operation."""
         session_id = self._session_id
         if not session_id:
+            if self._pending_open_guard is not None:
+                self.invalidate()
+                return False
             # No session to close and no operation started on its behalf:
             # the generation counter must stay untouched. Bumping
             # _active_generation here would mark a never-started operation
@@ -268,33 +348,74 @@ class ChatService(QObject):
         return True
 
     def invalidate(self) -> None:
-        """Drop in-flight results (view closed / model changed)."""
-        self._generation += 1
-        self._active_generation = 0
-        self._bridge = None
-
-    def close(self) -> None:
-        """Stop accepting operations and release the session on Core."""
+        """Invalidate pending work and asynchronously close all known sessions."""
+        if (
+            not self.is_busy
+            and self._session_id is None
+            and self._pending_open_guard is None
+            and self._bridge is None
+            and self._active_operation is None
+        ):
+            return
+        was_busy = self.is_busy
         session_id = self._session_id
-        self._shutting_down = True
         self._session_id = None
         self._model_id = None
         self._generation += 1
         self._active_generation = 0
         self._bridge = None
+        self._active_operation = None
+        open_guard = self._pending_open_guard
+        self._pending_open_guard = None
+        if open_guard is not None:
+            info = open_guard.invalidate()
+            if info is not None:
+                self._schedule_session_cleanup(info.session_id)
         if session_id:
-            self._start("close", session_id=session_id, keep_busy=False)
+            self._schedule_session_cleanup(session_id)
+        if was_busy:
+            self.busy_changed.emit(False)
+
+    def close(self) -> None:
+        """Stop accepting operations and release the session on Core."""
+        if self._shutting_down:
+            return
+        self._shutting_down = True
+        self.invalidate()
         self.closed.emit()
+
+    def _schedule_session_cleanup(self, session_id: str) -> None:
+        runnable = _SessionCleanupRunnable(self._client, session_id)
+        try:
+            self._thread_pool_factory().start(runnable)
+        except Exception:  # noqa: BLE001 - never break lifecycle invalidation
+            _logger.warning(
+                "Could not schedule cleanup for an invalidated Chat session",
+                exc_info=True,
+            )
 
     # -- internals ---------------------------------------------------------
 
-    def _start(self, operation: str, *, keep_busy: bool = True, **kwargs: Any) -> None:
+    def _start(
+        self,
+        operation: str,
+        *,
+        keep_busy: bool = True,
+        open_guard: Optional[_OpenSessionGuard] = None,
+        **kwargs: Any,
+    ) -> None:
+        self._active_operation = operation
         bridge = _ChatBridge(self._generation, self)
         bridge.resolved.connect(self._on_resolved)
         bridge.failed.connect(self._on_failed)
         self._bridge = bridge
         runnable = _ChatRunnable(
-            bridge, self._generation, operation, self._client, **kwargs
+            bridge,
+            self._generation,
+            operation,
+            self._client,
+            open_guard=open_guard,
+            **kwargs,
         )
         self._thread_pool_factory().start(runnable)
         if keep_busy:
@@ -307,8 +428,11 @@ class ChatService(QObject):
             return
         if generation != self._active_generation:
             return  # stale result after invalidation
+        if kind == "opened":
+            self._pending_open_guard = None
         self._active_generation = 0
         self._bridge = None
+        self._active_operation = None
         self.busy_changed.emit(False)
         if kind == "opened":
             info: ChatSessionInfo = data
@@ -326,7 +450,10 @@ class ChatService(QObject):
             # The failure belongs to a superseded operation: dropping it
             # keeps a late error from being reported as the current one.
             return
+        if self._active_operation == "open":
+            self._pending_open_guard = None
         self._active_generation = 0
         self._bridge = None
+        self._active_operation = None
         self.busy_changed.emit(False)
         self.failed.emit(message)

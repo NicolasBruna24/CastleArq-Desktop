@@ -18,6 +18,8 @@
 
 from __future__ import annotations
 
+import os
+import signal
 import subprocess
 
 import pytest
@@ -30,10 +32,14 @@ from castlearq_desktop.core.lifecycle_manager import build_launch_args
 from castlearq_desktop.core.subprocess_adapter import SubprocessProcessAdapter
 
 ABS_PYTHON = "/abs/env/bin/python"
+_NEXT_FAKE_PID = 42000
 
 
 class FakePopen:
     def __init__(self, exit_code=None, raises=None):
+        global _NEXT_FAKE_PID
+        self.pid = _NEXT_FAKE_PID
+        _NEXT_FAKE_PID += 1
         self._exit_code = exit_code
         self._raises = raises or {}
         self.terminates = 0
@@ -97,7 +103,7 @@ def test_successful_spawn_returns_owned_handle():
     adapter = SubprocessProcessAdapter(popen_factory=PopenFactory(popen=popen))
     handle = adapter.spawn(build_launch_args(ABS_PYTHON), shell=False)
     assert handle.popen is popen
-    assert handle.is_alive() is True
+    assert handle.is_alive is True
     assert handle.poll() is None
 
 
@@ -106,7 +112,7 @@ def test_status_and_exit_code():
     adapter = SubprocessProcessAdapter(popen_factory=PopenFactory(popen=popen))
     handle = adapter.spawn(build_launch_args(ABS_PYTHON), shell=False)
     popen.exit(3)
-    assert handle.is_alive() is False
+    assert handle.is_alive is False
     assert handle.poll() == 3
 
 
@@ -155,31 +161,69 @@ class BrokenIsAlivePopen(FakePopen):
         raise RuntimeError("status down")
 
 
-def test_signals_target_only_owned_child():
+@pytest.mark.skipif(os.name == "nt", reason="POSIX process-group signaling")
+def test_signals_target_only_owned_child(monkeypatch):
+    import castlearq_desktop.core.subprocess_adapter as adapter_module
+
     first = FakePopen()
     second = FakePopen()
     adapter = SubprocessProcessAdapter(
         popen_factory=PopenFactory(popen=first))
     handle = adapter.spawn(build_launch_args(ABS_PYTHON), shell=False)
+    calls = []
+    monkeypatch.setattr(adapter_module.os, "kill",
+                        lambda pid, sig: calls.append((pid, sig)))
     handle.terminate()
     handle.kill()
-    assert first.terminates == 1
-    assert first.kills == 1
+    assert calls == [(-first.pid, signal.SIGTERM),
+                     (-first.pid, signal.SIGKILL)]
     assert second.terminates == 0
     assert second.kills == 0
 
 
+@pytest.mark.skipif(os.name == "nt", reason="POSIX fallback signaling")
+@pytest.mark.parametrize("error_type", [
+    ProcessLookupError, PermissionError, OSError,
+])
+def test_posix_signal_errors_fall_back_to_owned_popen(monkeypatch, error_type):
+    import castlearq_desktop.core.subprocess_adapter as adapter_module
+
+    popen = FakePopen()
+    handle = SubprocessProcessAdapter(
+        popen_factory=PopenFactory(popen=popen)).spawn(
+            build_launch_args(ABS_PYTHON), shell=False)
+
+    def fail_signal(pid, sig):
+        raise error_type("simulated signal failure")
+
+    monkeypatch.setattr(adapter_module.os, "kill", fail_signal)
+    handle.terminate()
+    handle.kill()
+    assert popen.terminates == 1
+    assert popen.kills == 1
+
+
 def test_no_blocking_waits_in_adapter():
     import inspect
-    import pathlib
-    src = pathlib.Path(__file__).resolve().parent.parent.joinpath(
-        "src/castlearq_desktop/core/subprocess_adapter.py").read_text()
-    for forbidden in ("time.sleep", ".wait(", ".communicate(", "QThread",
-                      "concurrent.futures", "threading.Thread"):
-        assert forbidden not in src
-    assert "sleep" not in inspect.getsource(
-        __import__("castlearq_desktop.core.subprocess_adapter",
-                   fromlist=["SubprocessProcessHandle"]))
+    from castlearq_desktop.core.lifecycle_manager import LifecycleManager
+    from castlearq_desktop.core.startup_controller import StartupController
+    from castlearq_desktop.core.subprocess_adapter import SubprocessProcessHandle
+
+    shutdown_path = (
+        LifecycleManager.stop,
+        LifecycleManager.observe,
+        StartupController.request_shutdown,
+        SubprocessProcessHandle.terminate,
+        SubprocessProcessHandle.kill,
+        SubprocessProcessHandle.poll,
+        SubprocessProcessHandle.is_alive.fget,
+    )
+    for method in shutdown_path:
+        src = inspect.getsource(method)
+        for forbidden in ("time.sleep", "sleep(", ".wait(",
+                          ".communicate(", "QThread",
+                          "concurrent.futures", "threading.Thread"):
+            assert forbidden not in src
 
 
 class FakeClock:

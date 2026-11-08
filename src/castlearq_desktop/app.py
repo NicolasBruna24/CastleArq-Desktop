@@ -77,6 +77,7 @@ def shutdown_exit_code(state: object) -> int:
 _READINESS_LOGGERS = (
     "castlearq_desktop.core.readiness_qt_transport",
     "castlearq_desktop.ui.main_window",
+    "castlearq_desktop.core.download_service",
 )
 
 #: Maximum size (bytes) for each readiness debug log file before rotation.
@@ -214,7 +215,8 @@ def main(argv: Optional[List[str]] = None) -> int:
     # DEC-A (conservative admission): the static input stays NOT_EVALUATED
     # (fail-closed); per-pass dynamics engage through the coordinator's
     # installed-version provider, and production READY requires a matched
-    # version that is explicitly allowlisted — currently 0.5.1 (see
+    # version that is explicitly allowlisted — currently 0.5.1, 0.6.0, or
+    # 0.6.1 (see
     # core/version_admission.py).
     #
     # The installed-version probe is a bounded blocking subprocess (5 s), so

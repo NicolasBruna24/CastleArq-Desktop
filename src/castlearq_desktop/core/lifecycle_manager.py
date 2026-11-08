@@ -44,6 +44,7 @@ class LifecycleState(Enum):
 
 
 class ProcessHandle(Protocol):
+    @property
     def is_alive(self) -> bool: ...
     def poll(self) -> Optional[int]: ...
     def terminate(self) -> None: ...
@@ -144,14 +145,14 @@ class LifecycleManager:
             code = handle.poll()
         except Exception:
             try:
-                alive = bool(handle.is_alive())
+                alive = bool(handle.is_alive)
             except Exception:
                 return "unknown"
             return "alive" if alive else "exited"
         if code is not None:
             return "exited"
         try:
-            if not handle.is_alive():
+            if not handle.is_alive:
                 return "exited"
         except Exception:
             return "unknown"

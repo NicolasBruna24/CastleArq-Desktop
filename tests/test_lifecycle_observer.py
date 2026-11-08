@@ -83,6 +83,7 @@ class FakeHandle:
         self._alive = alive
         self._exit_code = exit_code
 
+    @property
     def is_alive(self):
         return self._alive
 
@@ -102,6 +103,7 @@ class UnknownHandle(FakeHandle):
     def poll(self):
         raise RuntimeError("poll unavailable")
 
+    @property
     def is_alive(self):
         raise RuntimeError("status unavailable")
 
